@@ -70,9 +70,15 @@ module did not introduce (see upstream issue #88350).
 from __future__ import annotations
 
 import argparse
+import json
 import os
+from pathlib import Path
+import secrets
 import signal
+import socket
+import struct
 import sys
+import threading
 import time
 
 # Matches the grace period the per-server watchdog used before it escalated.
@@ -82,6 +88,132 @@ _REAP_POLL_S = 0.1
 # A command is "unregister <pgid>" -- around 20 characters. The cap only has to
 # be generous enough for a legitimate line; see _serve for why it exists.
 _MAX_LINE_CHARS = 256
+_MAX_STATUS_BYTES = 64 * 1024
+
+
+def process_identity(pid: int) -> dict:
+    """Linux process identity; an unreadable/reused process is never proof."""
+    fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+    return {"pid": pid, "ppid": int(fields[1]), "pgid": int(fields[2]),
+            "start_ticks": int(fields[19]),
+            "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip()}
+
+
+def _status_address(pid: int) -> str:
+    # Linux abstract sockets disappear with their owner. No stale file, path
+    # truncation or cross-profile filesystem state; peer credentials are checked.
+    return f"\0hermes-mcp-supervisor-{os.getuid()}-{pid}"
+
+
+class CoverageStatus:
+    """Read-only, same-UID live query of registrations received by this child.
+
+    Observation runs independently of stdin: an idle/malicious status client
+    cannot delay the parent's EOF or the existing reaper. No commands accepted
+    here can register groups, change policy or send signals.
+    """
+
+    def __init__(self):
+        self.identity = process_identity(os.getpid())
+        self.parent = process_identity(os.getppid())
+        self.registrations: dict[int, dict | None] = {}
+        self.lock = threading.Lock()
+        self.closed = threading.Event()
+        self.listener = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        try:
+            self.listener.bind(_status_address(os.getpid()))
+            self.listener.listen(4)
+            self.listener.settimeout(0.25)
+        except BaseException:
+            self.listener.close()
+            raise
+        self.thread = threading.Thread(target=self._serve_queries, daemon=True)
+        try:
+            self.thread.start()
+        except RuntimeError:
+            self.listener.close()
+            raise
+
+    def register(self, pgid: int) -> None:
+        try:
+            identity = process_identity(pgid)
+        except (OSError, ValueError, IndexError, RuntimeError):
+            identity = None
+        with self.lock:
+            # A duplicate register must not certify a recycled PID as the old
+            # group. Only an explicit unregister/register creates a new entry.
+            self.registrations.setdefault(pgid, identity)
+
+    def unregister(self, pgid: int) -> None:
+        with self.lock:
+            self.registrations.pop(pgid, None)
+
+    def _serve_queries(self) -> None:
+        while not self.closed.is_set():
+            try:
+                connection, _ = self.listener.accept()
+            except TimeoutError:
+                continue
+            except OSError:
+                return
+            with connection:
+                try:
+                    connection.settimeout(0.25)
+                    _, uid, _ = struct.unpack("3i", connection.getsockopt(
+                        socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")))
+                    if uid != os.getuid():
+                        continue
+                    nonce = connection.recv(128).decode("ascii")
+                    if len(nonce) != 32 or any(c not in "0123456789abcdef" for c in nonce):
+                        continue
+                    with self.lock:
+                        registrations = dict(self.registrations)
+                    body = json.dumps({"schema": 1, "nonce": nonce,
+                        "supervisor": self.identity, "parent": self.parent,
+                        "registrations": registrations}).encode()
+                    if len(body) <= _MAX_STATUS_BYTES:
+                        connection.sendall(body)
+                except (OSError, UnicodeError, ValueError):
+                    continue
+
+    def close(self) -> None:
+        self.closed.set()
+        try:
+            self.listener.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        self.listener.close()
+        self.thread.join(timeout=0.5)
+
+
+def query_coverage(pid: int, timeout: float = 1.0) -> dict:
+    """Challenge the live child, verifying peer credentials and process identity.
+
+    Consumers must also compare each returned registration with the current
+    target process; this function authenticates the reply, not desired coverage.
+    """
+    before = process_identity(pid)
+    nonce = secrets.token_hex(16)
+    with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as client:
+        client.settimeout(timeout)
+        client.connect(_status_address(pid))
+        peer_pid, uid, _ = struct.unpack("3i", client.getsockopt(
+            socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")))
+        if peer_pid != pid or uid != os.getuid():
+            raise ValueError("supervisor peer identity mismatch")
+        client.sendall(nonce.encode())
+        raw = client.recv(_MAX_STATUS_BYTES + 1)
+    if len(raw) > _MAX_STATUS_BYTES:
+        raise ValueError("oversized supervisor reply")
+    reply = json.loads(raw)
+    if (reply.get("schema") != 1 or reply.get("nonce") != nonce
+            or reply.get("supervisor") != before or process_identity(pid) != before):
+        raise ValueError("stale or invalid supervisor reply")
+    parent = reply.get("parent") or {}
+    if (parent.get("pid") != before["ppid"]
+            or process_identity(before["ppid"]) != parent):
+        raise ValueError("supervisor owner identity mismatch")
+    return reply
 
 
 def _is_safe_target(pgid: int, *, own_pgid: int, parent_pgid: int) -> bool:
@@ -138,7 +270,7 @@ def _reap(pgids: set[int]) -> None:
             pass
 
 
-def _serve(stream, *, own_pgid: int, parent_pgid: int) -> set[int]:
+def _serve(stream, *, own_pgid: int, parent_pgid: int, coverage=None) -> set[int]:
     """Read control lines until EOF; return the groups still registered.
 
     Reads are length-capped rather than newline-terminated. Iterating the
@@ -169,8 +301,12 @@ def _serve(stream, *, own_pgid: int, parent_pgid: int) -> set[int]:
         if verb == "register":
             if _is_safe_target(pgid, own_pgid=own_pgid, parent_pgid=parent_pgid):
                 registered.add(pgid)
+                if coverage is not None:
+                    coverage.register(pgid)
         elif verb == "unregister":
             registered.discard(pgid)
+            if coverage is not None:
+                coverage.unregister(pgid)
     return registered
 
 
@@ -181,10 +317,20 @@ def main(argv=None) -> int:
     parser.add_argument(
         "--parent-pgid",
         type=int,
-        required=True,
         help="Process group of the spawning Hermes process; never signalled.",
     )
+    parser.add_argument("--query", type=int, metavar="PID",
+                        help="Read live Linux supervisor coverage; never changes registrations.")
     args = parser.parse_args(argv)
+    if args.query is not None:
+        try:
+            print(json.dumps(query_coverage(args.query)))
+            return 0
+        except (OSError, ValueError, KeyError, IndexError, AttributeError) as exc:
+            print(json.dumps({"error": type(exc).__name__, "coverage": "unverifiable"}))
+            return 1
+    if args.parent_pgid is None:
+        parser.error("--parent-pgid is required unless --query is used")
 
     # The parent may be torn down with killpg on its own group. We are spawned
     # with start_new_session=True precisely so that sweep cannot take us with
@@ -207,8 +353,21 @@ def main(argv=None) -> int:
         except (ValueError, OSError):
             pass
 
-    registered = _serve(sys.stdin, own_pgid=own_pgid, parent_pgid=args.parent_pgid)
-    _reap(registered)
+    coverage = None
+    if sys.platform == "linux":
+        try:
+            coverage = CoverageStatus()
+        except (OSError, ValueError, IndexError, RuntimeError):
+            # Failure of observation must not remove the reaping safety net.
+            # External probes fail closed when the query cannot be answered.
+            print("mcp_death_supervisor: live coverage unavailable", file=sys.stderr)
+    try:
+        registered = _serve(sys.stdin, own_pgid=own_pgid,
+                            parent_pgid=args.parent_pgid, coverage=coverage)
+        _reap(registered)
+    finally:
+        if coverage is not None:
+            coverage.close()
     return 0
 
 
