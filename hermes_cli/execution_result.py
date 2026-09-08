@@ -102,6 +102,22 @@ def validate_result(value: Any, *, expected_execution_id: str | None = None,
         digest = entry.get('sha256')
         if digest is not None and (not isinstance(digest, str) or len(digest) != 64 or any(c not in '0123456789abcdef' for c in digest)):
             raise ValueError('invalid evidence SHA-256')
+    presentation=value.get('presentation', {})
+    if not isinstance(presentation,dict):
+        raise ValueError('presentation must be an object')
+    if presentation.get('body') is not None:
+        import hashlib
+        body=presentation['body']
+        if not isinstance(body,str) or not body.strip() or len(body.encode('utf-8')) > 256_000:
+            raise ValueError('invalid presentation body')
+        digest=hashlib.sha256(body.encode('utf-8')).hexdigest()
+        if presentation.get('sha256') != digest or not any(entry.get('sha256')==digest and entry.get('role')=='message_body' for entry in evidence):
+            raise ValueError('presentation requires matching immutable evidence')
+    runtime=value['metrics'].get('runtime', {})
+    if not isinstance(runtime,dict) or not isinstance(runtime.get('processes', []),list):
+        raise ValueError('runtime process observations must be an array')
+    if any(not isinstance(item,dict) or (item.get('reason') is not None and not isinstance(item['reason'],str)) for item in runtime.get('processes', [])):
+        raise ValueError('invalid runtime process observation')
     if value['outcome'] in ('completed', 'noop') and code != 0:
         raise ValueError('functional completion requires exit zero')
     if value['outcome'] == 'completed' and not evidence:
@@ -128,6 +144,7 @@ def build_result(*, subject_type: str, outcome: str = 'unknown', **fields: Any) 
         'progress': {'completed': None, 'total': None, 'unit': None, 'details': {}},
         'continuation': {'eligible_at': None, 'condition': None, 'automatic': None},
         'metrics': {}, 'policy': {'id': None, 'thresholds': {}}, 'evidence': [],
+        'presentation': {'body': None, 'sha256': None},
         'delivery': {'status': None, 'reason': None},
     }
     for key, field in fields.items():
@@ -157,7 +174,8 @@ def render_result(value: dict, *, locale: str = 'en') -> str:
         title = subject_titles.get(r['subject_type'], title)
         if r['subject_type'] == 'stage' and r['metrics'].get('stage'):
             title += ': ' + str(r['metrics']['stage'])
-    lines = [title]
+    body=r.get('presentation',{}).get('body')
+    lines = [title] + ([body] if body else [])
     reason = r['reason']
     if reason.get('detail'):
         lines.append(reason['detail'])

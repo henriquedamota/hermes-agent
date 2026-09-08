@@ -98,3 +98,12 @@ Tests in `tests/cron/test_*result*`, `test_functional_continuation.py`,
 actual subprocess boundary, canonical validation, store reload, interrupted
 teardown, independent delivery, clock ordering, explicit continuation and
 reserved observation capacity. Run them with `scripts/run_tests.sh`.
+
+Content-producing jobs may include `presentation.body` and its SHA-256. The
+receipt must reference immutable `message_body` evidence with that exact hash.
+The canonical renderer preserves this verified content together with the
+functional outcome, trace and delivery failure. This lets briefings/editorial
+jobs deliver their actual artifact without interpreting arbitrary stdout or
+repeating completed work after transport failure. Legacy receipts without this
+optional field remain valid. Runtime process observations are validated before
+rendering and cannot crash a notification through a malformed nested payload.
