@@ -743,66 +743,111 @@ def cmd_mcp_list(args=None):
 
 # ─── hermes mcp test ──────────────────────────────────────────────────────────
 
+def _record_mcp_probe(name, *, started_at, started_monotonic, tools, code, reason,
+                      error_type=None, protocol_error_code=None):
+    """Persist the common result with only discovery evidence, never credentials.
+
+    A nested probe gets its own identity. It must not finalize the cron job
+    whose execution context happens to be inherited by this CLI process.
+    """
+    from datetime import datetime, timezone
+    import hashlib
+    import json
+    from pathlib import Path
+    import uuid
+
+    from hermes_cli.build_info import get_code_identity
+    from hermes_cli.execution_result import build_result, write_result
+
+    ident = uuid.uuid4().hex
+    finished_at = datetime.now(timezone.utc)
+    valid_clock = finished_at >= started_at
+    if not valid_clock:
+        code, reason = 74, 'mcp_probe_clock_invalid'
+    root = Path(get_hermes_home()) / 'state' / 'mcp-probes' / ident
+    root.mkdir(mode=0o700, parents=True)
+    names = sorted(name for name, _description in tools) if tools is not None else None
+    sample = {
+        'server': name, 'execution_id': ident, 'exit_code': code,
+        'observed_at': finished_at.isoformat(), 'tool_names': names,
+        'operations_verified': ['initialize', 'tools/list'] if code == 0 else [],
+        'tool_calls_verified': False, 'error_type': error_type, 'protocol_error_code': protocol_error_code,
+        'producer_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+    }
+    data = (json.dumps(sample, ensure_ascii=False, sort_keys=True) + '\n').encode()
+    proof = root / 'discovery.json'
+    with open(proof, 'xb', opener=lambda p, flags: os.open(p, flags, 0o600)) as stream:
+        stream.write(data)
+        stream.flush()
+        os.fsync(stream.fileno())
+    result = build_result(
+        subject_type='probe', outcome='completed' if code == 0 else 'unknown' if code == 74 else 'failed',
+        execution_id=ident, code_revision=get_code_identity().get('sha'),
+        started_at=started_at.isoformat() if valid_clock else None,
+        finished_at=finished_at.isoformat(), duration_s=time.monotonic() - started_monotonic,
+        exit_code=code, reason={'code': reason, 'detail': {
+            'mcp_discovery_verified': 'Conexão MCP e descoberta de ferramentas verificadas; chamadas não foram executadas.',
+            'mcp_connection_failed': 'A conexão ou a descoberta MCP falhou; ferramentas não foram confirmadas.',
+            'mcp_server_missing': 'Servidor MCP ausente da configuração consultada.',
+            'mcp_probe_clock_invalid': 'Relógio inconsistente; resultado da consulta não pode ser validado.',
+        }.get(reason, 'A consulta MCP não produziu evidência válida.')},
+        metrics=sample | {'parent_execution_id': os.environ.get('HERMES_EXECUTION_ID')},
+        policy={'id': 'hermes-mcp-discovery/v1'},
+        evidence=[{'path': str(proof), 'sha256': hashlib.sha256(data).hexdigest(), 'role': 'mcp_discovery'}],
+    )
+    write_result(root / f'{ident}.json', result)
+    return result
+
+
 def cmd_mcp_test(args):
-    """Test connection to an MCP server."""
+    """Test actual discovery and return a status the CLI dispatcher preserves."""
+    from datetime import datetime, timezone
+    import json
+
     name = args.name
+    started_at, started_monotonic = datetime.now(timezone.utc), time.monotonic()
+    json_mode = getattr(args, 'json', False)
     servers = _get_mcp_servers()
-
+    tools = None
+    error_type = None
+    protocol_error_code = None
     if name not in servers:
-        _error(f"Server '{name}' not found in config.")
-        available = list(servers.keys())
-        if available:
-            _info(f"Available: {', '.join(available)}")
-        return
-
-    cfg = servers[name]
-    print()
-    print(color(f"  Testing '{name}'...", Colors.CYAN))
-
-    # Show transport info
-    if "url" in cfg:
-        _info(f"Transport: HTTP → {cfg['url']}")
+        code, reason = 2, 'mcp_server_missing'
+        if not json_mode:
+            _error(f"Server '{name}' not found in config.")
     else:
-        cmd = cfg.get("command", "?")
-        _info(f"Transport: stdio → {cmd}")
-
-    # Show auth info (masked)
-    auth_type = cfg.get("auth", "")
-    headers = cfg.get("headers", {})
-    if auth_type == "oauth":
-        _info("Auth: OAuth 2.1 PKCE")
-    elif headers:
-        for k, v in headers.items():
-            if isinstance(v, str) and ("key" in k.lower() or "auth" in k.lower()):
-                # Mask the value (accepts ${VAR} and Cursor-style ${env:VAR})
-                resolved = _ENV_VAR_PATTERN.sub(lambda m: os.getenv(_env_ref_name(m.group(1)), ""), v)
-                if len(resolved) > 8:
-                    masked = resolved[:4] + "***" + resolved[-4:]
-                else:
-                    masked = "***"
-                print(f"    {k}: {masked}")
-    else:
-        _info("Auth: none")
-
-    # Attempt connection
-    start = time.monotonic()
-    try:
-        tools = _probe_single_server(name, cfg)
-        elapsed_ms = (time.monotonic() - start) * 1000
-    except Exception as exc:
-        elapsed_ms = (time.monotonic() - start) * 1000
-        _error(f"Connection failed ({elapsed_ms:.0f}ms): {exc}")
-        return
-
-    _success(f"Connected ({elapsed_ms:.0f}ms)")
-    _success(f"Tools discovered: {len(tools)}")
-
-    if tools:
-        print()
+        if not json_mode:
+            print(color(f"  Testing '{name}'...", Colors.CYAN))
+        try:
+            tools = _probe_single_server(name, servers[name])
+            if not isinstance(tools, list) or any(
+                not isinstance(item, (tuple, list)) or len(item) != 2
+                or not isinstance(item[0], str) or not item[0] for item in tools
+            ):
+                raise ValueError('invalid tool discovery response')
+            code, reason = 0, 'mcp_discovery_verified'
+        except Exception as exc:
+            tools = None
+            code, reason, error_type = 1, 'mcp_connection_failed', type(exc).__name__
+            # Exception strings may contain arbitrary credentials, including
+            # forms no pattern redactor can identify. Preserve typed protocol
+            # evidence instead of copying opaque text to the public receipt.
+            candidate = getattr(getattr(exc, 'error', None), 'code', None)
+            protocol_error_code = candidate if type(candidate) is int else None
+            if not json_mode:
+                _error(f"Connection or tool discovery failed ({error_type}).")
+    result = _record_mcp_probe(name, started_at=started_at, started_monotonic=started_monotonic,
+                               tools=tools, code=code, reason=reason, error_type=error_type,
+                               protocol_error_code=protocol_error_code)
+    if json_mode:
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    elif result['exit_code'] == 0:
+        _success(f"Connected ({result['duration_s'] * 1000:.0f}ms)")
+        _success(f"Tools discovered: {len(tools)}")
         for tool_name, desc in tools:
-            short = desc[:55] + "..." if len(desc) > 55 else desc
+            short = str(desc)[:55]
             print(f"    {color(tool_name, Colors.GREEN):36s} {short}")
-    print()
+    return result['exit_code']
 
 
 # ─── hermes mcp login ────────────────────────────────────────────────────────
@@ -1181,7 +1226,9 @@ def mcp_command(args):
 
     handler = handlers.get(action)
     if handler:
-        handler(args)
+        result = handler(args)
+        if action == "test" and result:
+            raise SystemExit(result)
     else:
         # No subcommand — drop the user into the catalog picker. This is the
         # "try enabling and it flows you into setup" UX matching `hermes plugin`.

@@ -107,3 +107,20 @@ jobs deliver their actual artifact without interpreting arbitrary stdout or
 repeating completed work after transport failure. Legacy receipts without this
 optional field remain valid. Runtime process observations are validated before
 rendering and cannot crash a notification through a malformed nested payload.
+
+## MCP discovery probes
+
+`hermes mcp test <server> --json` emits this same result contract and saves an
+immutable discovery sample and receipt under `state/mcp-probes/<execution_id>`
+in the selected Hermes home. It returns 1 for connection/discovery failure,
+2 for a missing configured server and 74 for an invalid observation clock.
+The human CLI preserves these failure codes as well. A successful handshake
+and `tools/list` prove discovery only: `metrics.tool_calls_verified` remains
+false. Callers requiring actual search/get-page output must verify those calls.
+
+Nested probes allocate a separate identity and retain the parent's execution
+ID as context; they never publish over its `HERMES_RESULT_PATH`. Descriptions,
+credentials and configured URLs are excluded from the sample. Failures preserve
+the exception type and structured protocol code, with unknown codes left null;
+opaque exception text is excluded. The producer hash identifies the exact
+adapter used. Probe failure does not imply a credential or provider cause.
