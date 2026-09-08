@@ -124,3 +124,14 @@ credentials and configured URLs are excluded from the sample. Failures preserve
 the exception type and structured protocol code, with unknown codes left null;
 opaque exception text is excluded. The producer hash identifies the exact
 adapter used. Probe failure does not imply a credential or provider cause.
+
+
+## Update receipt continuity
+
+The updater's receipt holds transaction state across the checkout replacement.
+It is protected from stale-module eviction together with the executing updater;
+lazy imports during restart and finalization must reach that same instance.
+Otherwise the restart can occur while its receipt silently disappears. The
+regression exercises begin, module purge, restart recording and exactly-once
+finalization, preserving the pre-update inventory step and affected process IDs.
+All unrelated runtime modules remain eligible for refresh.
