@@ -99,6 +99,9 @@ _STALE_PURGE_PROTECTED = frozenset(
         "hermes_cli.main",
         "hermes_cli.update_cmd",
         "hermes_cli.hermes_logging",
+        # The receipt owns this update's in-flight transaction state. Lazy
+        # restart/finalization imports must keep recording into that instance.
+        "hermes_cli.update_receipt",
     }
 )
 

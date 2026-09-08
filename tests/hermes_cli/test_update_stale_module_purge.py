@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import sys
 import types
+import importlib
+import json
 
 import pytest
 
@@ -80,6 +82,26 @@ def test_purge_protects_executing_modules():
     assert sys.modules.get("hermes_cli.update_cmd") is update_cmd
     assert sys.modules.get("hermes_cli.main") is cli_main
     assert "hermes_cli" in sys.modules
+
+
+def test_inflight_update_receipt_survives_purge_and_records_restart(monkeypatch, tmp_path):
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    receipt = importlib.import_module('hermes_cli.update_receipt')
+    monkeypatch.setattr(receipt, '_receipt_dir', lambda: tmp_path / 'receipts')
+    receipt.begin_update_receipt()
+    receipt.record_step('pre_update_inventory', True, 'two observed runtimes')
+    update_cmd._purge_stale_hermes_modules()
+    current = importlib.import_module('hermes_cli.update_receipt')
+    current.record_gateway_restart(restarted_services=['hermes-gateway'], killed_pids=[1234])
+    path = current.finalize_update_receipt('partial')
+    assert path is not None, 'the pre-pull receipt was lost when stale modules were evicted'
+    value = json.loads(path.read_text())
+    assert value['steps'][0]['name'] == 'pre_update_inventory'
+    assert value['gateway_restart']['killed_pids'] == [1234]
+    assert value['gateway_restart']['restarted_services'] == ['hermes-gateway']
+    assert value['outcome'] == 'partial'
+    assert current.finalize_update_receipt('success') is None
+    assert json.loads(path.read_text())['outcome'] == 'partial'
 
 
 def test_purge_leaves_prefix_lookalikes_alone():
