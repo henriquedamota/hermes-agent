@@ -180,11 +180,16 @@ def _dispatch_display(dispatch: dict) -> Optional[str]:
     )
 
 
-def cron_list(show_all: bool = False):
+def cron_list(show_all: bool = False, *, json_output: bool = False):
     """List all scheduled jobs."""
     from cron.jobs import list_jobs
 
     jobs = list_jobs(include_disabled=show_all)
+
+    if json_output:
+        from cron.result_export import job_record
+        print(json.dumps({'contract':'hermes.job-list/v1', 'jobs':[job_record(job) for job in jobs]}, ensure_ascii=False))
+        return
 
     if not jobs:
         print(color("No scheduled jobs.", Colors.DIM))
@@ -341,11 +346,16 @@ def cron_tick():
     return 0
 
 
-def cron_runs(job_id: Optional[str] = None, limit: int = 20):
+def cron_runs(job_id: Optional[str] = None, limit: int = 20, *, json_output: bool = False):
     """Show indexed durable cron execution history."""
     from cron.executions import list_executions
 
     records = list_executions(job_id=job_id, limit=limit)
+    if json_output:
+        from cron.result_export import execution
+        print(json.dumps({'contract':'hermes.execution-history/v1',
+                          'records':[execution(record) for record in records]}, ensure_ascii=False))
+        return
     if not records:
         print("No cron execution attempts recorded.")
         return
@@ -880,6 +890,7 @@ def cron_edit(args):
         monitor_url=getattr(args, "monitor_url", None),
         continuity=getattr(args, "continuity", None),
         reasoning_effort=getattr(args, "reasoning_effort", None),
+        **({"execution_policy":args.execution_policy} if getattr(args,"execution_policy",None) is not None else {}),
     )
     if not result.get("success"):
         print(color(f"Failed to update job: {result.get('error', 'unknown error')}", Colors.RED))
@@ -1060,7 +1071,7 @@ def cron_command(args):
 
     if subcmd is None or subcmd == "list":
         show_all = getattr(args, 'all', False)
-        cron_list(show_all)
+        cron_list(show_all, json_output=getattr(args, 'json', False))
         return 0
 
     if subcmd == "status":
@@ -1074,7 +1085,7 @@ def cron_command(args):
         return cron_tick()
 
     if subcmd in {"runs", "history"}:
-        cron_runs(getattr(args, "job_id", None), getattr(args, "limit", 20))
+        cron_runs(getattr(args, "job_id", None), getattr(args, "limit", 20), json_output=getattr(args, 'json', False))
         return 0
 
     if subcmd == "incidents":

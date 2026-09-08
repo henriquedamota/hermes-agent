@@ -2316,6 +2316,7 @@ def create_job(
     monitor_url: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
     failure_deliver: Optional[str] = None,
+    execution_policy: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -2540,6 +2541,9 @@ def create_job(
         "enabled_toolsets": normalized_toolsets,
         "workdir": normalized_workdir,
     }
+    if execution_policy is not None:
+        from cron.functional_results import policy_for
+        job["execution_policy"] = dict(policy_for({"execution_policy":execution_policy}))
     # Only persist attach_to_session when explicitly set, so existing jobs and
     # the common case stay byte-identical (absent key => fall back to the
     # global cron.mirror_delivery config, default off).
@@ -2635,6 +2639,10 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
         raise ValueError(
             f"Cron job field(s) cannot be updated: {', '.join(sorted(bad_fields))}"
         )
+
+    if "execution_policy" in updates:
+        from cron.functional_results import policy_for
+        updates["execution_policy"] = dict(policy_for({"execution_policy":updates["execution_policy"]}))
 
     with _jobs_lock():
         jobs = load_jobs()
@@ -3005,6 +3013,7 @@ def mark_job_run(
     status: Optional[str] = None,
     *,
     expected_fire_owner: Optional[str] = None,
+    functional_result: Optional[dict] = None,
 ) -> bool:
     with _fire_job_lock(job_id) as acquired:
         if not acquired:
@@ -3016,6 +3025,7 @@ def mark_job_run(
             delivery_error,
             status=status,
             expected_fire_owner=expected_fire_owner,
+            functional_result=functional_result,
         )
 
 
@@ -3110,6 +3120,7 @@ def _mark_job_run_locked(
     *,
     status: Optional[str] = None,
     expected_fire_owner: Optional[str] = None,
+    functional_result: Optional[dict] = None,
 ) -> bool:
     """
     Mark a job as having been run.
@@ -3132,6 +3143,16 @@ def _mark_job_run_locked(
     (T1-26), so `cronjob list` distinguishes "your config is broken" from
     "the run itself failed".
     """
+    outcome = None
+    if functional_result is not None:
+        from hermes_cli.execution_result import validate_result
+        validate_result(functional_result, now=_hermes_now())
+        if functional_result['job_id'] != job_id:
+            raise ValueError('functional result belongs to another job')
+        outcome = functional_result['outcome']
+    waiting = outcome in ('deferred', 'partial', 'skipped')
+    healed = outcome in ('completed', 'noop') if outcome is not None else success
+    failed = outcome in ('failed', 'unknown') if outcome is not None else not success
     with _jobs_lock():
         jobs = load_jobs()
         for i, job in enumerate(jobs):
@@ -3160,6 +3181,8 @@ def _mark_job_run_locked(
                 # ``status`` override (e.g. "blocked_config") still wins.
                 if status:
                     job["last_status"] = status
+                elif outcome is not None:
+                    job["last_status"] = outcome
                 elif not success:
                     job["last_status"] = "error"
                 elif isinstance(delivery_error, str) and delivery_error.strip():
@@ -3172,22 +3195,27 @@ def _mark_job_run_locked(
                 # re-alerts instead of being silently swallowed. Same contract
                 # for the drift marker (#44585 alert-once): a run that made it
                 # through the guard means resolution matches again.
-                if success:
+                if healed:
                     job.pop("preflight_alerted", None)
                     job.pop("drift_alerted", None)
                     # The fire hand-off demonstrably works again — clear the
                     # forward-failure stamp so it only ever describes the
                     # CURRENT auto-fire health, not a healed past incident.
                     job.pop("last_fire_error", None)
-                # Consecutive agent-failure streak. Any successful run resets
-                # it; delivery failures alone do NOT count (the agent did its
-                # job). Read by the scheduler's failure-delivery path to nudge
+                # Functional failures survive expected waits. Only verified
+                # completion/noop heals them; process and delivery failures
+                # remain independently available in execution history. Used to nudge
                 # the user to review a repeatedly-failing automation
                 # (Poke-inspired; see cron/scheduler._failure_streak_nudge).
-                if success:
+                if healed:
                     job["failure_streak"] = 0
-                else:
+                elif failed:
                     job["failure_streak"] = int(job.get("failure_streak") or 0) + 1
+                    job["last_failure"] = {"at": now, "detail": error,
+                        "execution_id": functional_result.get('execution_id') if functional_result else None}
+                # Expected waits preserve the existing streak and causal evidence.
+                if functional_result is not None:
+                    job['last_functional_outcome'] = outcome
                 # Track delivery failures separately — cleared on successful delivery
                 job["last_delivery_error"] = delivery_error
                 # Clear any external-fire claim so a re-armed recurring job can
@@ -3204,7 +3232,7 @@ def _mark_job_run_locked(
                 # (issue #38758), which already incremented completed — do not
                 # double-count them here.  Recurring jobs and direct callers
                 # with no pre-run claim still get the legacy increment.
-                if job.get("repeat"):
+                if job.get("repeat") and not waiting:
                     repeat = job["repeat"]
                     times = repeat.get("times")
                     completed = repeat.get("completed", 0)
@@ -3239,6 +3267,26 @@ def _mark_job_run_locked(
                 
                 # Compute next run
                 job["next_run_at"] = compute_next_run(job["schedule"], now)
+
+                job.pop('continuation', None)
+                continuation = functional_result.get('continuation', {}) if functional_result else {}
+                if (outcome in ('deferred', 'partial') and continuation.get('automatic') is True
+                        and continuation.get('eligible_at') and job.get('state') != 'paused'):
+                    from datetime import datetime, timedelta
+                    eligible = datetime.fromisoformat(continuation['eligible_at'].replace('Z', '+00:00'))
+                    eligible = max(eligible, datetime.fromisoformat(now) + timedelta(seconds=60))
+                    regular = job['next_run_at']
+                    job['continuation'] = {**continuation, 'execution_id': functional_result['execution_id'],
+                        'scheduled_next_at': regular, 'eligible_at': eligible.isoformat()}
+                    if regular is None or eligible < datetime.fromisoformat(regular):
+                        job['next_run_at'] = eligible.isoformat()
+                    # A one-shot's preclaim consumed the dispatch budget before
+                    # functional completion. Re-arm only its explicit continuation.
+                    if job.get('schedule', {}).get('kind') == 'once':
+                        repeat = job.get('repeat') or {}
+                        if repeat.get('completed', 0) > 0:
+                            repeat['completed'] -= 1
+                        job['enabled'] = True
 
                 # If no next run, decide whether this is terminal completion
                 # (one-shot) or a transient failure (recurring schedule couldn't
@@ -4380,12 +4428,9 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
     return due
 
 
-# Per-run cron output (`cron/output/<job>/<timestamp>.md`) is written once per
-# execution. Unlike the quick-snapshot store (`hermes_cli.backup`, capped at 20)
-# it had no retention, so a frequently-scheduled job on a long-running deploy
-# accumulated one file per run forever and could fill the disk (#52383). Keep the
-# most recent N files per job; a non-positive value disables pruning (opt-out).
-_CRON_OUTPUT_DEFAULT_KEEP = 50
+# Outputs are incident evidence. No implicit retention removes them; operators
+# can opt into a bounded policy after choosing their own archival strategy.
+_CRON_OUTPUT_DEFAULT_KEEP = 0
 
 
 def _cron_output_keep() -> int:
@@ -4403,9 +4448,8 @@ def _prune_job_output(job_output_dir: Path, keep: int) -> int:
     """Remove the oldest ``*.md`` run-output files beyond *keep*. Returns count deleted.
 
     Mirrors the quick-snapshot retention in ``hermes_cli.backup._prune_quick_snapshots``:
-    output filenames are timestamp-based (``%Y-%m-%d_%H-%M-%S.md``) so a reverse
-    lexical sort orders newest-first, and everything past *keep* is the tail to
-    drop. A non-positive *keep* disables pruning. Pruning failures are swallowed
+    Retention uses actual file mtimes; random identity suffixes are not clocks.
+    Everything past an explicitly configured *keep* is the tail to drop. A non-positive *keep* disables pruning. Pruning failures are swallowed
     so they can never break output saving.
     """
     if keep <= 0:
@@ -4413,7 +4457,7 @@ def _prune_job_output(job_output_dir: Path, keep: int) -> int:
     try:
         files = sorted(
             (f for f in job_output_dir.glob("*.md") if f.is_file()),
-            key=lambda f: f.name,
+            key=lambda f: (f.stat().st_mtime_ns, f.name),
             reverse=True,
         )
     except OSError:
@@ -4436,7 +4480,7 @@ def save_job_output(job_id: str, output: str):
     _secure_dir(job_output_dir)
 
     timestamp = _hermes_now().strftime("%Y-%m-%d_%H-%M-%S")
-    output_file = job_output_dir / f"{timestamp}.md"
+    output_file = job_output_dir / f"{timestamp}-{uuid.uuid4().hex}.md"
 
     fd, tmp_path = tempfile.mkstemp(dir=str(job_output_dir), suffix='.tmp', prefix='.output_')
     try:

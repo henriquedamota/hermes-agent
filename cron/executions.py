@@ -12,6 +12,7 @@ import sqlite3
 import threading
 import time
 import uuid
+from pathlib import Path
 from contextlib import contextmanager
 from typing import Any, Dict, Iterator, List, Optional
 
@@ -76,6 +77,9 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
     add_column_if_missing(
         conn, "executions", "delivery_outcome", "delivery_outcome TEXT"
     )
+    add_column_if_missing(conn, "executions", "functional_status", "functional_status TEXT")
+    add_column_if_missing(conn, "executions", "functional_result_json", "functional_result_json TEXT")
+    add_column_if_missing(conn, "executions", "output_file", "output_file TEXT")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_executions_job_claimed "
         "ON executions(job_id, claimed_at DESC, id DESC)"
@@ -248,6 +252,19 @@ def mark_execution_running(execution_id: str) -> Optional[Dict[str, Any]]:
     return record
 
 
+def record_observation(execution_id: str, *, output_file: str | None = None,
+                       delivery_outcome: str | None = None) -> bool:
+    """Persist a known effect before teardown can interrupt terminal completion."""
+    if delivery_outcome not in (None, 'delivered', 'failed', 'not_configured', 'suppressed', 'suppressed_acked'):
+        raise ValueError('unrecognized delivery outcome')
+    with _transaction() as conn:
+        changed = conn.execute('''UPDATE executions
+            SET output_file=COALESCE(?,output_file), delivery_outcome=COALESCE(?,delivery_outcome)
+            WHERE id=? AND status IN ('claimed','running') AND process_id=? AND pid=?''',
+            (output_file, delivery_outcome, execution_id, _PROCESS_ID, os.getpid())).rowcount
+    return changed == 1
+
+
 def finish_execution(
     execution_id: str, *, success: bool, error: Optional[str] = None,
     delivery_outcome: Optional[str] = None,
@@ -260,13 +277,23 @@ def finish_execution(
     status = "completed" if success else "failed"
     detail = None if success else (str(error) if error else "unknown failure")
     with _transaction() as conn:
+        row = conn.execute("SELECT job_id,delivery_outcome FROM executions WHERE id=?", (execution_id,)).fetchone()
+        if row is None:
+            return None
+        if delivery_outcome is None:
+            delivery_outcome = row['delivery_outcome']
+        from cron.functional_results import ledger_result
+        import json
+        functional = ledger_result(get_hermes_home(), execution_id, row["job_id"],
+                                   delivery_outcome=delivery_outcome)
         cur = conn.execute(
             """UPDATE executions
                SET status=?, finished_at=?, error=?, handoff_pending=0,
-                   handoff_started_at=NULL, delivery_outcome=?
+                   handoff_started_at=NULL, delivery_outcome=?, functional_status=?, functional_result_json=?
                WHERE id=? AND status IN ('claimed','running')
                  AND process_id=? AND pid=?""",
-            (status, now, detail, delivery_outcome, execution_id, _PROCESS_ID, os.getpid()),
+            (status, now, detail, delivery_outcome, functional["outcome"],
+             json.dumps(functional,ensure_ascii=False,sort_keys=True), execution_id, _PROCESS_ID, os.getpid()),
         )
         if cur.rowcount != 1:
             return None

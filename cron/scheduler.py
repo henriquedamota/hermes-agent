@@ -55,6 +55,7 @@ from hermes_cli.config import (
 )
 from hermes_cli.fallback_config import get_fallback_chain
 from hermes_time import now as _hermes_now
+from cron import functional_results
 from agent.interrupt_compat import request_hard_interrupt
 from agent.delegation_context import (
     enter_non_dispatcher_owned_context,
@@ -3270,7 +3271,10 @@ def _deliver_result(
     if wrap_response:
         task_name = job.get("name", job["id"])
         job_id = job.get("id", "")
-        delivery_content = (
+        if functional_results.policy_for(job).get('locale') == 'pt-BR':
+            delivery_content = f"{task_name}\n\n{content}\n\nJob: {job_id}"
+        else:
+            delivery_content = (
             f"Cronjob Response: {task_name}\n"
             f"(job_id: {job_id})\n"
             f"-------------\n\n"
@@ -4608,6 +4612,11 @@ def _run_job_script(
         return False, f"Script path is not a file: {path}"
 
     script_timeout = _get_script_timeout()
+    remaining_wall = functional_results.remaining_wall_seconds()
+    if remaining_wall is not None:
+        script_timeout = min(script_timeout, remaining_wall)
+        if script_timeout <= 0:
+            return False, "Execution wall deadline reached before script admission"
 
     # Pick an interpreter by extension.  Bash for .sh/.bash, Python for
     # everything else.  We deliberately do NOT honour the file's own
@@ -4654,11 +4663,14 @@ def _run_job_script(
             }
         env = build_subprocess_env()
         env.update(env_overlay)
+        env.update(functional_results.environment())
         # Use the job's workdir as the subprocess cwd when configured,
         # otherwise default to the scripts-dir parent (back-compat).
         # NEVER mutate the Python process cwd — that would leak into
         # concurrent gateway sessions (#69396).
         _script_cwd = workdir or str(path.parent)
+        _process_started_at = datetime.now(timezone.utc).isoformat()
+        _process_started = time.monotonic()
         proc = subprocess.Popen(
             argv,
             stdout=subprocess.PIPE,
@@ -4675,6 +4687,8 @@ def _run_job_script(
                 # must not orphan own-session grandchildren either.
                 _terminate_cron_script_tree(proc)
                 _drain_script_pipes(proc)
+                functional_results.record_process(script=str(path),pid=getattr(proc, 'pid', None),exit_code=proc.returncode,
+                    started_at=_process_started_at,duration_s=time.monotonic()-_process_started,reason='cancelled')
                 return False, "Script cancelled because cron fire ownership was lost"
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -4689,6 +4703,8 @@ def _run_job_script(
                 # layer's tree-kill (#85147, d6a5cb9725).
                 _terminate_cron_script_tree(proc)
                 _drain_script_pipes(proc)
+                functional_results.record_process(script=str(path),pid=getattr(proc, 'pid', None),exit_code=proc.returncode,
+                    started_at=_process_started_at,duration_s=time.monotonic()-_process_started,reason='wall_deadline')
                 return False, f"Script timed out after {script_timeout}s: {path}"
             try:
                 stdout_raw, stderr_raw = proc.communicate(timeout=min(0.1, remaining))
@@ -4698,6 +4714,8 @@ def _run_job_script(
 
         stdout = (stdout_raw or "").strip()
         stderr = (stderr_raw or "").strip()
+        functional_results.record_process(script=str(path),pid=getattr(proc, 'pid', None),exit_code=proc.returncode,
+            started_at=_process_started_at,duration_s=time.monotonic()-_process_started,reason='process_exited')
 
         # Redact secrets from both stdout and stderr before any return path.
         try:
@@ -5795,6 +5813,7 @@ class _BoundedCronSessionDB:
         return _bounded
 
 
+@functional_results.execution_scope(lambda: _get_hermes_home())
 def run_job(
     job: dict,
     *,
@@ -6851,6 +6870,9 @@ def run_job(
                     "Job '%s': run_claim heartbeat failed", job_name, exc_info=True
                 )
 
+        _remaining_wall = functional_results.remaining_wall_seconds()
+        if _remaining_wall is not None and _remaining_wall <= 0:
+            raise TimeoutError('Cron wall deadline exhausted before agent dispatch')
         _cron_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         # Preserve scheduler-scoped ContextVar state (for example skill-declared
         # env passthrough registrations) when the cron run hops into the worker
@@ -6866,6 +6888,7 @@ def run_job(
             task_id=_cron_task_id,
         )
         _inactivity_timeout = False
+        _wall_timeout = False
         _watch_stop = threading.Event()
 
         def _idle_seconds() -> float:
@@ -6902,19 +6925,29 @@ def run_job(
                 # ``get_activity_summary`` on this thread can no longer keep
                 # the 600s inactivity limit from firing (#94285).
                 _watch_thread.start()
-            if _cron_inactivity_limit is None and not _is_oneshot and cancel_event is None:
+            if (_cron_inactivity_limit is None and not _is_oneshot and cancel_event is None
+                    and functional_results.remaining_wall_seconds() is None):
                 result = _cron_future.result()
             else:
                 result = None
                 while True:
+                    remaining_wall = functional_results.remaining_wall_seconds()
+                    if remaining_wall is not None and remaining_wall <= 0:
+                        _wall_timeout = True
+                        break
+                    wait_seconds = min(_POLL_INTERVAL, remaining_wall) if remaining_wall is not None else _POLL_INTERVAL
                     done, _ = concurrent.futures.wait(
-                        {_cron_future}, timeout=_POLL_INTERVAL,
+                        {_cron_future}, timeout=wait_seconds,
                     )
                     if done:
                         _abort_if_fire_claim_lost()
                         result = _cron_future.result()
                         break
                     if _inactivity_timeout:
+                        break
+                    remaining_wall = functional_results.remaining_wall_seconds()
+                    if remaining_wall is not None and remaining_wall <= 0:
+                        _wall_timeout = True
                         break
                     _abort_if_fire_claim_lost()
                     _heartbeat_run_claim_if_due()
@@ -6924,6 +6957,10 @@ def run_job(
         finally:
             _watch_stop.set()
             _cron_pool.shutdown(wait=False, cancel_futures=True)
+
+        if _wall_timeout:
+            request_hard_interrupt(agent, "Cron job timed out (wall deadline)")
+            raise TimeoutError(f"Cron job '{job_name}' reached its wall deadline; activity does not reset this budget")
 
         if _inactivity_timeout:
             # Build diagnostic summary from the agent's activity tracker.
@@ -7498,6 +7535,19 @@ def run_one_job(
                     _running_fire_owners.pop(job["id"], None)
 
 
+def _delivery_status(*, delivery_error, should_deliver, unresolved_origin,
+                     normalized_deliver, incident_acked, success):
+    if delivery_error:
+        return "failed"
+    if should_deliver and unresolved_origin:
+        return "not_configured"
+    if should_deliver and normalized_deliver != "local":
+        return "delivered"
+    if incident_acked and not success:
+        return "suppressed_acked"
+    return "suppressed"
+
+
 def _run_one_job_body(
     job: dict,
     *,
@@ -7693,6 +7743,8 @@ def _run_one_job_body(
                 if not owns_output:
                     raise _FireClaimLostDuringSideEffect
                 output_file = save_job_output(job["id"], output)
+                from cron.executions import record_observation
+                record_observation(execution_id, output_file=str(output_file))
             if verbose:
                 logger.info("Output saved to: %s", output_file)
 
@@ -7765,7 +7817,9 @@ def _run_one_job_body(
                     if incident_acked and not drift_skip:
                         deliver_content = ""
                     else:
-                        deliver_content = (
+                        structured_message = functional_results.failure_message(
+                            _get_hermes_home(), execution_id, job)
+                        deliver_content = structured_message if structured_message is not None else (
                             _summarize_cron_failure_for_delivery(job, error)
                             + _failure_streak_nudge(job)
                         )
@@ -7791,6 +7845,9 @@ def _run_one_job_body(
             # empty-response guard below mark the run as a soft failure.
             should_deliver = bool(deliver_content.strip())
             if blocked_config_silent or drift_skip_silent:
+                should_deliver = False
+            if (should_deliver and not blocked_config and not drift_skip
+                    and not functional_results.should_notify(_get_hermes_home(), execution_id, job)):
                 should_deliver = False
             unresolved_origin = False
             # Cron silence suppression — see _is_cron_silence_response.  Replaces the
@@ -7836,6 +7893,11 @@ def _run_one_job_body(
                         raise
                     delivery_error = str(de)
                     logger.error("Delivery failed for job %s: %s", job["id"], de)
+            record_observation(execution_id, delivery_outcome=_delivery_status(
+                delivery_error=delivery_error, should_deliver=should_deliver,
+                unresolved_origin=unresolved_origin,
+                normalized_deliver=_normalize_deliver_value(_delivery_lane_value(job, for_failure=not success)),
+                incident_acked=incident_acked, success=success))
         except _FireClaimLostDuringSideEffect:
             side_effect_ownership_lost = True
         finally:
@@ -7905,6 +7967,12 @@ def _run_one_job_body(
             return True
 
         mark_kwargs = {"delivery_error": delivery_error}
+        try:
+            receipt = functional_results.read_result(_get_hermes_home(), execution_id, job_id=str(job['id']))
+        except (ValueError, OSError):
+            receipt = functional_results.ledger_result(_get_hermes_home(), execution_id, str(job['id']), delivery_outcome=None)
+        if receipt is not None:
+            mark_kwargs['functional_result'] = receipt
         if fire_owner is not None:
             mark_kwargs["expected_fire_owner"] = fire_owner
         if blocked_config:
@@ -7920,19 +7988,9 @@ def _run_one_job_body(
         normalized_deliver = _normalize_deliver_value(
             _delivery_lane_value(job, for_failure=not success)
         )
-        if delivery_error:
-            delivery_outcome = "failed"
-        elif should_deliver and unresolved_origin:
-            delivery_outcome = "not_configured"
-        elif should_deliver and normalized_deliver != "local":
-            delivery_outcome = "delivered"
-        elif incident_acked and not success:
-            # Distinct from plain "suppressed" (silence marker / local jobs):
-            # the failure ping was withheld because the operator acked this
-            # exact signature via `hermes cron incidents ack`.
-            delivery_outcome = "suppressed_acked"
-        else:
-            delivery_outcome = "suppressed"
+        delivery_outcome = _delivery_status(delivery_error=delivery_error,
+            should_deliver=should_deliver, unresolved_origin=unresolved_origin,
+            normalized_deliver=normalized_deliver, incident_acked=incident_acked, success=success)
         if delivery_outcome in ("delivered", "not_configured") and not success:
             # The failure ping left the process (or was composed for a
             # configured target) — record it on the incident so the CLI
@@ -8722,6 +8780,26 @@ def tick(
         if verbose:
             logger.info("%s - %s job(s) due", _hermes_now().strftime('%H:%M:%S'), len(due_jobs))
 
+        # Resolve configured capacity before consuming the opportunity. A bad
+        # lane must leave its job due and must not stop unrelated valid work.
+        selected_lanes = {}
+        eligible_jobs = []
+        named_config = None
+        for job in due_jobs:
+            try:
+                lane = functional_results.policy_for(job).get('lane', 'default')
+                if lane != 'default':
+                    from cron import dispatch_lanes
+                    if named_config is None:
+                        named_config = (load_config().get('cron') or {}).get('execution_lanes', {})
+                    selected_lanes[job['id']] = dispatch_lanes.pool(lane, named_config)
+                eligible_jobs.append(job)
+            except (ValueError, TypeError, AttributeError) as exc:
+                from cron.dispatch_lanes import record_refusal
+                record_refusal(_get_hermes_home(), job, str(exc))
+                logger.error("Cron dispatch configuration refused job %s: %s", job['id'], exc)
+        due_jobs = eligible_jobs
+
         # Advance next_run_at for all recurring jobs FIRST, under the file lock,
         # before any execution begins.  This preserves at-most-once semantics.
         # For parallel jobs that are already running, the advance keeps
@@ -8914,8 +8992,12 @@ def tick(
         # queue needed.
         if parallel_jobs:
             pool = _get_parallel_pool(_max_workers)
+            # Priority orders arrivals within this tick; already queued older
+            # opportunities keep FIFO position and cannot be starved by new ticks.
+            parallel_jobs = sorted(parallel_jobs, key=lambda j: functional_results.policy_for(j).get('priority', 100))
             for job in parallel_jobs:
-                fut = _submit_with_guard(job, pool)
+                selected_pool = selected_lanes.get(job['id'], pool)
+                fut = _submit_with_guard(job, selected_pool)
                 if fut is None:
                     continue
                 _all_futures.append(fut)

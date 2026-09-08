@@ -666,6 +666,13 @@ def _inject_session_context_env(env: dict) -> None:
     kept. See gateway/session_context.session_context_engaged and
     tests/tools/test_local_env_session_leak.py.
     """
+    # Cron receipt destinations are per execution, including when the terminal
+    # backend/snapshot is shared by several jobs. Never inherit a stale value.
+    from cron.functional_results import environment as execution_environment
+
+    for name in ('HERMES_EXECUTION_ID', 'HERMES_JOB_ID', 'HERMES_RESULT_PATH'):
+        env.pop(name, None)
+    env.update(execution_environment())
     try:
         from gateway.session_context import (
             _UNSET,
