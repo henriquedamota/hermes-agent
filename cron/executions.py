@@ -22,7 +22,9 @@ from hermes_time import now as _hermes_now
 # dashboard operations that temporarily enter another profile cannot leak that
 # profile's execution records into the import-time home.
 EXECUTIONS_FILE: Optional[Path] = None
-MAX_TERMINAL_EXECUTIONS = 1000
+# Retention is not implicit permission to erase incident history. Unlimited by
+# default; an explicit module override remains supported for bounded stores.
+MAX_TERMINAL_EXECUTIONS: Optional[int] = None
 HANDOFF_ADOPTION_GRACE_SECONDS = 30.0
 _TERMINAL_STATES = ("completed", "failed", "unknown")
 _lock = threading.RLock()
@@ -70,6 +72,9 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
     )
     add_column_if_missing(
         conn, "executions", "handoff_started_at", "handoff_started_at REAL"
+    )
+    add_column_if_missing(
+        conn, "executions", "delivery_outcome", "delivery_outcome TEXT"
     )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_executions_job_claimed "
@@ -140,6 +145,8 @@ def _owner_is_live(pid: int, started_at: Optional[int]) -> bool:
 
 
 def _prune_unlocked(conn: sqlite3.Connection) -> None:
+    if MAX_TERMINAL_EXECUTIONS is None:
+        return
     limit = max(0, int(MAX_TERMINAL_EXECUTIONS))
     conn.execute(
         """DELETE FROM executions WHERE id IN (
@@ -246,6 +253,9 @@ def finish_execution(
     delivery_outcome: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Write a terminal result once; terminal attempts cannot be rewritten."""
+    if delivery_outcome not in (None, "delivered", "failed", "not_configured",
+                                "suppressed", "suppressed_acked"):
+        raise ValueError("unrecognized delivery outcome")
     now = _hermes_now().isoformat()
     status = "completed" if success else "failed"
     detail = None if success else (str(error) if error else "unknown failure")
@@ -253,10 +263,10 @@ def finish_execution(
         cur = conn.execute(
             """UPDATE executions
                SET status=?, finished_at=?, error=?, handoff_pending=0,
-                   handoff_started_at=NULL
+                   handoff_started_at=NULL, delivery_outcome=?
                WHERE id=? AND status IN ('claimed','running')
                  AND process_id=? AND pid=?""",
-            (status, now, detail, execution_id, _PROCESS_ID, os.getpid()),
+            (status, now, detail, delivery_outcome, execution_id, _PROCESS_ID, os.getpid()),
         )
         if cur.rowcount != 1:
             return None
