@@ -9,6 +9,7 @@ import contextlib
 import copy
 from contextvars import ContextVar
 from dataclasses import dataclass
+import errno
 import json
 import logging
 import shutil
@@ -21,8 +22,8 @@ import uuid
 
 # Cross-process advisory file locking for jobs.json critical sections.
 # fcntl is Unix-only; on Windows fall back to msvcrt. Either may be absent,
-# in which case _jobs_lock() degrades to in-process locking only (the old
-# behaviour) rather than failing.
+# in which case mutations fail closed; a process-local lock cannot protect
+# a store shared with another gateway or CLI process.
 try:
     import fcntl
 except ImportError:  # pragma: no cover - non-Unix
@@ -270,25 +271,17 @@ def _jobs_lock_file() -> Path:
     return _current_cron_store().cron_dir / ".jobs.lock"
 
 
+class CronStoreLockError(RuntimeError):
+    """The shared store could not be locked; no mutation was authorized."""
+
+
 @contextlib.contextmanager
 def _jobs_lock():
-    """Serialize a load_jobs→modify→save_jobs critical section.
+    """Bounded, reentrant exclusion for a load/modify/save transaction.
 
-    Combines the in-process threading lock (cheap mutual exclusion between
-    the gateway's parallel tick threads) with a cross-process advisory file
-    lock on ``<cron dir>/.jobs.lock`` (mutual exclusion between the gateway process
-    and standalone ``hermes`` CLI invocations, which previously shared no lock
-    at all — a `cron pause` could be silently clobbered by a concurrent
-    gateway write, leaving a "paused" job still firing).
-
-    The flock is blocking, but every critical section that uses it is short
-    (field updates only — no agent execution), so contention resolves in
-    milliseconds. If neither fcntl nor msvcrt is available the manager still
-    provides in-process locking, matching the historical behaviour.
-
-    Nested calls in the same thread reuse the held lock so legacy callers that
-    invoke save_jobs() inside a broader mutation section don't deadlock or try
-    to reacquire the advisory file lock.
+    Both the process-local and cross-process lock are mandatory. A stalled
+    holder raises an observable error so the ticker can retry later; it never
+    authorizes an unprotected write to keep the scheduler superficially green.
     """
     depth = getattr(_jobs_lock_state, "depth", 0)
     if depth:
@@ -299,80 +292,52 @@ def _jobs_lock():
             _jobs_lock_state.depth -= 1
         return
 
-    with _jobs_file_lock:
-        _jobs_lock_state.depth = 1
-        # Stamp of jobs.json as of this section's load_jobs() (#80703's
-        # fast-path, credit @JoaoMarcos44): lets _save_jobs_unlocked skip the
-        # shrink-merge parse when the file provably hasn't changed since this
-        # section read it. Reset on entry/exit so stale stamps from unlocked
-        # loads or prior sections can never suppress a needed merge.
-        _jobs_lock_state.load_stamp = None
-        lock_fd = None
-        try:
+    if not _jobs_file_lock.acquire(timeout=_JOBS_LOCK_TIMEOUT_SECONDS):
+        logger.error("Timed out waiting for local cron jobs lock; no mutation authorized")
+        raise CronStoreLockError("local cron jobs lock timeout")
+    lock_fd = None
+    acquired = False
+    try:
+        ensure_dirs()
+        lock_fd = open(_jobs_lock_file(), "a+", encoding="utf-8")
+        lock_fd.seek(0)
+        if fcntl is None and msvcrt is None:
+            raise CronStoreLockError("cross-process cron jobs lock backend unavailable")
+        deadline = time.monotonic() + _JOBS_LOCK_TIMEOUT_SECONDS
+        while True:
             try:
-                ensure_dirs()
-                lock_fd = open(_jobs_lock_file(), "a+", encoding="utf-8")
-                lock_fd.seek(0)
                 if fcntl is not None:
-                    # Bounded acquisition (#60703): a plain blocking
-                    # fcntl.flock(LOCK_EX) here has NO timeout, and it is
-                    # taken while holding the process-wide _jobs_file_lock
-                    # RLock above.  If another process wedges while holding
-                    # .jobs.lock (e.g. an old gateway draining through a
-                    # restart), a single blocked acquirer freezes EVERY cron
-                    # function in this process — including the ticker's
-                    # get_due_jobs() — silently and forever: the heartbeat
-                    # file stops updating and all jobs stop firing with no
-                    # error logged.  Poll LOCK_NB against a deadline instead;
-                    # on timeout, log loudly and fall through to the same
-                    # in-process-only degraded mode used when locking is
-                    # unavailable.  A briefly-torn cross-process write is
-                    # strictly better than a permanently dead scheduler.
-                    _deadline = time.monotonic() + _JOBS_LOCK_TIMEOUT_SECONDS
-                    while True:
-                        try:
-                            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                            break
-                        except (OSError, IOError):
-                            if time.monotonic() >= _deadline:
-                                logger.error(
-                                    "Timed out after %.0fs waiting for the cron "
-                                    "jobs lock (%s) — another process is holding "
-                                    "it. Proceeding with in-process locking only "
-                                    "so the scheduler stays alive (#60703).",
-                                    _JOBS_LOCK_TIMEOUT_SECONDS,
-                                    _jobs_lock_file(),
-                                )
-                                try:
-                                    lock_fd.close()
-                                except OSError:
-                                    pass
-                                lock_fd = None
-                                break
-                            time.sleep(0.1)
-                elif msvcrt is not None:
-                    getattr(msvcrt, "locking")(lock_fd.fileno(), getattr(msvcrt, "LK_LOCK"), 1)
-            except (OSError, IOError) as e:
-                # Never let a locking failure take down cron writes — fall back to
-                # in-process-only protection (still held via _jobs_file_lock).
-                logger.warning("jobs.json cross-process lock unavailable (%s); "
-                               "proceeding with in-process lock only", e)
-            try:
-                yield
-            finally:
-                if lock_fd is not None:
-                    try:
-                        if fcntl is not None:
-                            fcntl.flock(lock_fd, fcntl.LOCK_UN)
-                        elif msvcrt is not None:
-                            getattr(msvcrt, "locking")(lock_fd.fileno(), getattr(msvcrt, "LK_UNLCK"), 1)
-                    except (OSError, IOError):
-                        pass
-                    finally:
-                        lock_fd.close()
+                    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                else:
+                    msvcrt.locking(lock_fd.fileno(), msvcrt.LK_NBLCK, 1)
+                acquired = True
+                break
+            except OSError as exc:
+                if exc.errno not in (errno.EAGAIN, errno.EWOULDBLOCK, errno.EACCES):
+                    raise
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    logger.error("Timed out waiting for cron jobs lock %s; no mutation authorized",
+                                 _jobs_lock_file())
+                    raise CronStoreLockError("cross-process cron jobs lock timeout") from exc
+                time.sleep(min(0.1, remaining))
+        _jobs_lock_state.depth = 1
+        _jobs_lock_state.load_stamp = None
+        yield
+    finally:
+        _jobs_lock_state.depth = 0
+        _jobs_lock_state.load_stamp = None
+        try:
+            if lock_fd is not None:
+                try:
+                    if acquired and fcntl is not None:
+                        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                    elif acquired and msvcrt is not None:
+                        msvcrt.locking(lock_fd.fileno(), msvcrt.LK_UNLCK, 1)
+                finally:
+                    lock_fd.close()
         finally:
-            _jobs_lock_state.depth = 0
-            _jobs_lock_state.load_stamp = None
+            _jobs_file_lock.release()
 
 
 @contextlib.contextmanager
@@ -3786,13 +3751,12 @@ def _sweep_completed_oneshots(
 
 
 def heartbeat_fire_claim(job_id: str, *, expected_owner: str) -> bool:
-    with _fire_job_lock(job_id) as acquired:
-        if not acquired:
-            return False
-        return _heartbeat_fire_claim_locked(
-            job_id,
-            expected_owner=expected_owner,
-        )
+    # A delivery can hold the side-effect fence longer than its lock timeout.
+    # Renewal does not revoke ownership or authorize another effect: its CAS
+    # under the shared jobs lock only updates the current owner's timestamp.
+    # Taking the delivery fence here made a run revoke its OWN heartbeat while
+    # delivering, then record a false shutdown after successful delivery.
+    return _heartbeat_fire_claim_locked(job_id, expected_owner=expected_owner)
 
 
 def _heartbeat_fire_claim_locked(job_id: str, *, expected_owner: str) -> bool:
