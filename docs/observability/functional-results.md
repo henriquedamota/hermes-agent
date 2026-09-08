@@ -174,3 +174,22 @@ não comprovam recusa e não silenciam mensagens. Se o próprio verificador da
 configuração falhar, a operação Atlas não inicia inferência: registra
 `configuration_check_failed`, resultado desconhecido e condição de retomada.
 O caminho anterior em inglês permanece compatível.
+
+
+## Hard cancellation and process birth during observation
+
+On POSIX, a hard cancellation freezes the root and newly discovered descendant
+identities before rescanning the tree. A child born during the first process
+snapshot is therefore included before termination destroys its ancestry. The
+rescan has a two-second/32-pass bound and logs exhaustion; successful signalling
+is not proof that an uninterruptible kernel task has exited. Previously detached
+processes outside the observed ancestry still require their owning supervisor
+or cgroup. Atlas stage wrappers retain their systemd containment and deadlines.
+
+The helper signals identity-checked descendants before the root. A failure to
+signal does not leave processes suspended by the helper, and a process already
+stopped before cancellation is not resumed. Explicit graceful signals retain
+their earlier behavior. Linux regression tests synchronize a real fork during
+a process snapshot and simulate signal refusal against only fixture-owned
+identities. They use the repository's explicit native-signal test marker: the
+default test guard cannot recognize a fixture descendant after reparenting.

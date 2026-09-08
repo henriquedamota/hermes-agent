@@ -78,6 +78,7 @@ def test_functional_completion_and_delivery_failure_persist_independently(runtim
     assert executions.finish_execution(entry['id'],success=False) is None
 
 
+@pytest.mark.live_system_guard_bypass
 def test_wall_deadline_reaps_script_grandchild_in_another_session(runtime):
     import os
     import sys
