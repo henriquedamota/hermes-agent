@@ -780,6 +780,8 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
     }
     if job.get("script"):
         result["script"] = job["script"]
+    if "execution_policy" in job:
+        result["execution_policy"] = job["execution_policy"]
     if job.get("reasoning_effort"):
         result["reasoning_effort"] = job["reasoning_effort"]
     if job.get("monitor_script"):
@@ -1533,6 +1535,7 @@ def cronjob(
     monitor_url: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
     failure_deliver: Optional[Union[str, List[str]]] = None,
+    execution_policy: Optional[Dict[str, Any]] = None,
     task_id: str = None,
     session_id: Optional[str] = None,
 ) -> str:
@@ -1655,6 +1658,7 @@ def cronjob(
                     # dispatch below: models do not make model-config
                     # decisions (standing policy).
                     reasoning_effort=reasoning_effort,
+                    **({"execution_policy":execution_policy} if execution_policy is not None else {}),
                     failure_deliver=_resolve_cron_context_deliver(
                         _normalize_deliver_param(failure_deliver)
                     ),
@@ -1883,6 +1887,8 @@ def cronjob(
                 updates["provider"] = _normalize_optional_job_value(provider)
             if base_url is not None:
                 updates["base_url"] = _normalize_optional_job_value(base_url, strip_trailing_slash=True)
+            if execution_policy is not None:
+                updates["execution_policy"] = execution_policy
             if reasoning_effort is not None:
                 # CLI-only lane (see create above): update_job validates
                 # against the canonical grammar; empty string clears the pin.

@@ -666,6 +666,16 @@ def _inject_session_context_env(env: dict) -> None:
     kept. See gateway/session_context.session_context_engaged and
     tests/tools/test_local_env_session_leak.py.
     """
+    # Cron receipt destinations are per execution, including when the terminal
+    # backend/snapshot is shared by several jobs. Never inherit a stale value.
+    for name in ('HERMES_EXECUTION_ID', 'HERMES_JOB_ID', 'HERMES_RESULT_PATH'):
+        env.pop(name, None)
+    # An execution context can only exist after the cron boundary loaded this
+    # module. Ordinary CLI/TUI subprocesses must not import the scheduler or
+    # initialize its profile store just to discover that no context is active.
+    execution_results = sys.modules.get('cron.functional_results')
+    if execution_results is not None:
+        env.update(execution_results.environment())
     try:
         from gateway.session_context import (
             _UNSET,

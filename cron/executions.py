@@ -12,6 +12,7 @@ import sqlite3
 import threading
 import time
 import uuid
+from pathlib import Path
 from contextlib import contextmanager
 from typing import Any, Dict, Iterator, List, Optional
 
@@ -76,10 +77,31 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
     add_column_if_missing(
         conn, "executions", "delivery_outcome", "delivery_outcome TEXT"
     )
+    add_column_if_missing(conn, "executions", "functional_status", "functional_status TEXT")
+    add_column_if_missing(conn, "executions", "functional_result_json", "functional_result_json TEXT")
+    add_column_if_missing(conn, "executions", "output_file", "output_file TEXT")
+    add_column_if_missing(conn, "executions", "sequence", "sequence INTEGER")
+    # Preserve creation order through clock changes, retention and VACUUM.
+    conn.execute("CREATE TABLE IF NOT EXISTS execution_sequence (singleton INTEGER PRIMARY KEY CHECK(singleton=1), value INTEGER NOT NULL)")
+    if conn.execute("SELECT 1 FROM execution_sequence WHERE singleton=1").fetchone() is None:
+        conn.execute("INSERT OR IGNORE INTO execution_sequence VALUES(1, (SELECT COALESCE(MAX(sequence),0) FROM executions))")
+    if conn.execute("SELECT 1 FROM executions WHERE sequence IS NULL LIMIT 1").fetchone():
+        # Old writers may have appended rows during a rolling upgrade. Allocate
+        # them after existing receipts under the same SQLite write transaction;
+        # do not reuse rowids, which VACUUM or explicit retention may recycle.
+        if not conn.in_transaction:
+            conn.execute("BEGIN IMMEDIATE")
+        high_water = conn.execute("SELECT MAX(value, (SELECT COALESCE(MAX(sequence),0) FROM executions)) FROM execution_sequence WHERE singleton=1").fetchone()[0]
+        for row in conn.execute("SELECT id FROM executions WHERE sequence IS NULL ORDER BY rowid").fetchall():
+            high_water += 1
+            conn.execute("UPDATE executions SET sequence=? WHERE id=?", (high_water, row[0]))
+        conn.execute("UPDATE execution_sequence SET value=? WHERE singleton=1", (high_water,))
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_execution_sequence ON executions(sequence)")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_executions_job_claimed "
         "ON executions(job_id, claimed_at DESC, id DESC)"
     )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_executions_job_sequence_v2 ON executions(job_id, sequence DESC)")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_executions_status_claimed "
         "ON executions(status, claimed_at DESC, id DESC)"
@@ -164,13 +186,15 @@ def create_execution(job_id: str, *, source: str) -> Dict[str, Any]:
     execution_id = uuid.uuid4().hex
     pid = os.getpid()
     with _transaction() as conn:
+        conn.execute("UPDATE execution_sequence SET value=value+1 WHERE singleton=1")
+        sequence = conn.execute("SELECT value FROM execution_sequence WHERE singleton=1").fetchone()[0]
         conn.execute(
             """INSERT INTO executions
                (id, job_id, source, process_id, pid, process_started_at,
-                status, claimed_at)
-               VALUES (?, ?, ?, ?, ?, ?, 'claimed', ?)""",
+                status, claimed_at, sequence)
+               VALUES (?, ?, ?, ?, ?, ?, 'claimed', ?, ?)""",
             (execution_id, str(job_id), str(source), _PROCESS_ID, pid,
-             _process_start_time(pid), now),
+             _process_start_time(pid), now, sequence),
         )
         row = conn.execute(
             "SELECT * FROM executions WHERE id=?", (execution_id,)
@@ -248,6 +272,19 @@ def mark_execution_running(execution_id: str) -> Optional[Dict[str, Any]]:
     return record
 
 
+def record_observation(execution_id: str, *, output_file: str | None = None,
+                       delivery_outcome: str | None = None) -> bool:
+    """Persist a known effect before teardown can interrupt terminal completion."""
+    if delivery_outcome not in (None, 'delivered', 'failed', 'not_configured', 'suppressed', 'suppressed_acked'):
+        raise ValueError('unrecognized delivery outcome')
+    with _transaction() as conn:
+        changed = conn.execute('''UPDATE executions
+            SET output_file=COALESCE(?,output_file), delivery_outcome=COALESCE(?,delivery_outcome)
+            WHERE id=? AND status IN ('claimed','running') AND process_id=? AND pid=?''',
+            (output_file, delivery_outcome, execution_id, _PROCESS_ID, os.getpid())).rowcount
+    return changed == 1
+
+
 def finish_execution(
     execution_id: str, *, success: bool, error: Optional[str] = None,
     delivery_outcome: Optional[str] = None,
@@ -260,13 +297,23 @@ def finish_execution(
     status = "completed" if success else "failed"
     detail = None if success else (str(error) if error else "unknown failure")
     with _transaction() as conn:
+        row = conn.execute("SELECT job_id,delivery_outcome FROM executions WHERE id=?", (execution_id,)).fetchone()
+        if row is None:
+            return None
+        if delivery_outcome is None:
+            delivery_outcome = row['delivery_outcome']
+        from cron.functional_results import ledger_result
+        import json
+        functional = ledger_result(get_hermes_home(), execution_id, row["job_id"],
+                                   delivery_outcome=delivery_outcome)
         cur = conn.execute(
             """UPDATE executions
                SET status=?, finished_at=?, error=?, handoff_pending=0,
-                   handoff_started_at=NULL, delivery_outcome=?
+                   handoff_started_at=NULL, delivery_outcome=?, functional_status=?, functional_result_json=?
                WHERE id=? AND status IN ('claimed','running')
                  AND process_id=? AND pid=?""",
-            (status, now, detail, delivery_outcome, execution_id, _PROCESS_ID, os.getpid()),
+            (status, now, detail, delivery_outcome, functional["outcome"],
+             json.dumps(functional,ensure_ascii=False,sort_keys=True), execution_id, _PROCESS_ID, os.getpid()),
         )
         if cur.rowcount != 1:
             return None
@@ -332,23 +379,32 @@ def recover_interrupted_executions() -> int:
 
 def list_executions(
     *, job_id: Optional[str] = None, limit: int = 50,
-    before_claimed_at: Optional[str] = None,
+    before_claimed_at: Optional[str] = None, before_sequence: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
-    """Return indexed, newest-first execution history with cursor pagination."""
+    """Return durable creation order, independent of clock shifts or UUID order.
+
+    ``before_sequence`` is a lossless pagination cursor. The legacy timestamp
+    argument remains an absolute time filter and honors explicit timezones.
+    """
     clauses: List[str] = []
     params: List[Any] = []
     if job_id is not None:
         clauses.append("job_id=?")
         params.append(str(job_id))
     if before_claimed_at is not None:
-        clauses.append("claimed_at < ?")
+        clauses.append("julianday(claimed_at) < julianday(?)")
         params.append(str(before_claimed_at))
+    if before_sequence is not None:
+        if type(before_sequence) is not int or before_sequence < 1:
+            raise ValueError('execution history cursor must be a positive sequence')
+        clauses.append("sequence < ?")
+        params.append(before_sequence)
     where = " WHERE " + " AND ".join(clauses) if clauses else ""
     params.append(max(1, min(int(limit), 500)))
     with _transaction() as conn:
         rows = conn.execute(
             "SELECT * FROM executions" + where
-            + " ORDER BY claimed_at DESC, id DESC LIMIT ?",
+            + " ORDER BY sequence DESC LIMIT ?",
             params,
         ).fetchall()
     return [dict(row) for row in rows]
@@ -381,7 +437,7 @@ def latest_executions(job_ids: List[str]) -> Dict[str, Dict[str, Any]]:
                 WHERE e.job_id IN ({placeholders})
                   AND e.id=(SELECT e2.id FROM executions e2
                             WHERE e2.job_id=e.job_id
-                            ORDER BY e2.claimed_at DESC, e2.id DESC LIMIT 1)""",
+                            ORDER BY e2.sequence DESC LIMIT 1)""",
             clean,
         ).fetchall()
     return {row["job_id"]: dict(row) for row in rows}

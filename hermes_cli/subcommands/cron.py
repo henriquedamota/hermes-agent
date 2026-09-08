@@ -22,6 +22,7 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     # cron list
     cron_list = cron_subparsers.add_parser("list", help="List scheduled jobs")
     cron_list.add_argument("--all", action="store_true", help="Include disabled jobs")
+    cron_list.add_argument("--json", action="store_true", help="Versioned job and functional-result projection")
 
     # cron create/add
     cron_create = cron_subparsers.add_parser(
@@ -184,6 +185,9 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         action="store_true",
         help="Remove all attached skills from the job",
     )
+    import json
+    cron_edit.add_argument("--execution-policy", type=json.loads,
+                           help="JSON execution policy: wall timeout, functional receipt and locale. Empty object clears.")
     cron_edit.add_argument(
         "--script",
         help=(
@@ -301,6 +305,8 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     )
     cron_runs.add_argument("job_id", nargs="?", help="Optional job ID filter")
     cron_runs.add_argument("--limit", type=int, default=20, help="Rows to show (1-500)")
+    cron_runs.add_argument("--before-sequence", type=int, help="Durable history cursor returned by --json")
+    cron_runs.add_argument("--json", action="store_true", help="Versioned execution and functional-result projection")
 
     # cron incidents — durable failure incidents (list/ack)
     cron_incidents = cron_subparsers.add_parser(
