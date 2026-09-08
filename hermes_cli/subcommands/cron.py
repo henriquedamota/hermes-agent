@@ -305,6 +305,7 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     )
     cron_runs.add_argument("job_id", nargs="?", help="Optional job ID filter")
     cron_runs.add_argument("--limit", type=int, default=20, help="Rows to show (1-500)")
+    cron_runs.add_argument("--before-sequence", type=int, help="Durable history cursor returned by --json")
     cron_runs.add_argument("--json", action="store_true", help="Versioned execution and functional-result projection")
 
     # cron incidents — durable failure incidents (list/ack)

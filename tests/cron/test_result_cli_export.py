@@ -46,3 +46,55 @@ def test_artifact_and_delivery_survive_interruption_before_terminal(tmp_path, mo
     assert finished['output_file']=='/isolated/output.md'
     assert finished['delivery_outcome']=='delivered'
     assert not ledger.record_observation(row['id'],delivery_outcome='failed')
+
+
+def test_latest_attempt_uses_durable_order_across_timezone_and_clock_changes(tmp_path, monkeypatch):
+    from datetime import datetime
+    from cron import executions as ledger
+    monkeypatch.setattr(ledger,'EXECUTIONS_FILE',tmp_path/'execution.sqlite')
+    monkeypatch.setenv('HERMES_HOME',str(tmp_path))
+    clocks=iter([datetime.fromisoformat('2026-09-08T09:00:00+00:00'),
+                 datetime.fromisoformat('2026-09-08T06:30:00-03:00'),
+                 datetime.fromisoformat('2026-09-08T06:00:00-03:00')])
+    monkeypatch.setattr(ledger,'_hermes_now',lambda:next(clocks))
+    first=ledger.create_execution('job',source='isolated')
+    second=ledger.create_execution('job',source='isolated')
+    third=ledger.create_execution('job',source='isolated')
+    assert ledger.latest_execution('job')['id']==third['id']
+    assert ledger.latest_executions(['job'])['job']['id']==third['id']
+    page=ledger.list_executions(limit=2)
+    assert [row['id'] for row in page]==[third['id'],second['id']]
+    older=ledger.list_executions(before_sequence=page[-1]['sequence'])
+    assert [row['id'] for row in older]==[first['id']]
+
+
+def test_durable_cursor_survives_database_vacuum(tmp_path, monkeypatch):
+    import sqlite3
+    from cron import executions as ledger
+    target=tmp_path/'execution.sqlite'
+    monkeypatch.setattr(ledger,'EXECUTIONS_FILE',target)
+    monkeypatch.setenv('HERMES_HOME',str(tmp_path))
+    first=ledger.create_execution('job',source='isolated')
+    second=ledger.create_execution('job',source='isolated')
+    third=ledger.create_execution('job',source='isolated')
+    conn=sqlite3.connect(target)
+    conn.execute('DELETE FROM executions WHERE id=?',(first['id'],));conn.commit()
+    conn.execute('VACUUM');conn.close()
+    assert [row['id'] for row in ledger.list_executions(before_sequence=third['sequence'])]==[second['id']]
+    later=ledger.create_execution('job',source='isolated')
+    assert later['sequence']>third['sequence']
+
+
+def test_legacy_writer_after_migration_does_not_reuse_cursor(tmp_path, monkeypatch):
+    import sqlite3
+    from cron import executions as ledger
+    target=tmp_path/'execution.sqlite'
+    monkeypatch.setattr(ledger,'EXECUTIONS_FILE',target)
+    monkeypatch.setenv('HERMES_HOME',str(tmp_path))
+    first=ledger.create_execution('job',source='isolated')
+    with sqlite3.connect(target) as conn:
+        conn.execute("INSERT INTO executions(id,job_id,source,process_id,pid,status,claimed_at) VALUES('legacy','job','isolated','old',1,'completed','2026-09-08T09:00:00+00:00')")
+    old=ledger.latest_execution('job')
+    later=ledger.create_execution('job',source='isolated')
+    assert old['id']=='legacy'
+    assert first['sequence']<old['sequence']<later['sequence']

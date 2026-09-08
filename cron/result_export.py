@@ -20,7 +20,7 @@ def execution(record: dict) -> dict:
                     'detail':'Registro anterior sem recibo funcional; resultado não inferido do processo.'})
     result['delivery']['status'] = record.get('delivery_outcome')
     validate_result(result)
-    return {**{key:record.get(key) for key in ('id','job_id','status','source','claimed_at',
+    return {**{key:record.get(key) for key in ('id','sequence','job_id','status','source','claimed_at',
               'started_at','finished_at','output_file','error','delivery_outcome')},
             'functional_result':result,'message':render_result(result,locale='pt-BR')}
 

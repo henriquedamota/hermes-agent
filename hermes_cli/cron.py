@@ -346,15 +346,18 @@ def cron_tick():
     return 0
 
 
-def cron_runs(job_id: Optional[str] = None, limit: int = 20, *, json_output: bool = False):
+def cron_runs(job_id: Optional[str] = None, limit: int = 20, *, json_output: bool = False, before_sequence: Optional[int] = None):
     """Show indexed durable cron execution history."""
     from cron.executions import list_executions
 
-    records = list_executions(job_id=job_id, limit=limit)
+    query = {'job_id':job_id,'limit':limit}
+    if before_sequence is not None:query['before_sequence'] = before_sequence
+    records = list_executions(**query)
     if json_output:
         from cron.result_export import execution
         print(json.dumps({'contract':'hermes.execution-history/v1',
-                          'records':[execution(record) for record in records]}, ensure_ascii=False))
+                          'records':[execution(record) for record in records],
+                          'next_before_sequence':records[-1].get('sequence') if len(records)==min(max(limit,1),500) else None}, ensure_ascii=False))
         return
     if not records:
         print("No cron execution attempts recorded.")
@@ -1085,7 +1088,7 @@ def cron_command(args):
         return cron_tick()
 
     if subcmd in {"runs", "history"}:
-        cron_runs(getattr(args, "job_id", None), getattr(args, "limit", 20), json_output=getattr(args, 'json', False))
+        cron_runs(getattr(args, "job_id", None), getattr(args, "limit", 20), json_output=getattr(args, 'json', False), before_sequence=getattr(args,'before_sequence',None))
         return 0
 
     if subcmd == "incidents":

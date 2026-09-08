@@ -51,7 +51,9 @@ time, not UUID lexical order. Receipts retain all observed content versions.
 
 Readers use `hermes cron runs --json` (`hermes.execution-history/v1`) and
 `hermes cron list --all --json` (`hermes.job-list/v1`), not text greps or nearby
-log timestamps. Delivery failure remains visible and does not schedule work
+log timestamps. History uses a persisted monotonic sequence and a
+`next_before_sequence` cursor, preserving creation order through clock changes,
+timezone changes, database compaction and retained legacy rows. Delivery failure remains visible and does not schedule work
 again. `last_status` uses the functional outcome for migrated jobs; older jobs
 retain their legacy process status, with unknown functional state in JSON.
 
