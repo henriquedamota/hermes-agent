@@ -135,3 +135,42 @@ Otherwise the restart can occur while its receipt silently disappears. The
 regression exercises begin, module purge, restart recording and exactly-once
 finalization, preserving the pre-update inventory step and affected process IDs.
 All unrelated runtime modules remain eligible for refresh.
+
+
+## Falhas do scheduler em português
+
+Jobs com `execution_policy.locale = "pt-BR"` registram a observação do scheduler
+em `cron/scheduler-failures/<execution_id>.json`, pelo mesmo contrato versionado,
+com histórico imutável. O tipo vem do ramo de controle: execução falhou, exceção
+do scheduler, configuração recusada ou divergência de configuração de inferência.
+Palavras no erro opaco não classificam credencial, provedor ou timeout. Os logs
+e o erro técnico da execução continuam separados da mensagem curta.
+
+O leitor do ledger e o renderizador usam essa mesma observação. Sem recibo do
+produtor, uma falha deixa o resultado funcional desconhecido; recusa comprovada
+antes da chamada ao modelo registra oportunidade não executada. Um script de
+contexto anterior continua representado nas observações de processo. Um recibo funcional já
+comprovado mantém seu resultado, mesmo se o scheduler falhar depois. A falha de
+entrega continua independente e não autoriza repetir efeitos externos. A primeira
+observação do scheduler não é substituída por uma nova chamada de renderização.
+
+A próxima oportunidade vem do estado válido da agenda ou do cálculo canônico
+`cron.jobs.compute_next_run` para jobs recorrentes habilitados, sempre condicionada
+à elegibilidade. Timestamp inválido permanece desconhecido. Campos da política
+inválidos ainda impedem a execução, mas não impedem a renderização do diagnóstico
+em português. O booleano de `run_one_job` indica que a oportunidade foi tratada;
+a conclusão funcional vem exclusivamente do recibo.
+
+Payload genérico, identidade/contrato divergente ou observação inválida não
+passam como prova do scheduler. O resultado funcional válido anterior é preservado,
+e a perda de observação continua acionável. Não há anúncio de recuperação nem
+recomendação automática de pausa no aviso de recorrência. O modo inglês anterior
+permanece compatível.
+
+As recusas em português vêm de `record_dispatch_refusal` no ponto real do
+preflight e seguem no contexto da execução até o recibo de runtime. Marcadores
+como `[blocked_config]` ou `[drift_skip:silent]` copiados para um erro opaco
+não comprovam recusa e não silenciam mensagens. Se o próprio verificador da
+configuração falhar, a operação Atlas não inicia inferência: registra
+`configuration_check_failed`, resultado desconhecido e condição de retomada.
+O caminho anterior em inglês permanece compatível.

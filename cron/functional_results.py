@@ -4,6 +4,7 @@ from __future__ import annotations
 from contextvars import ContextVar
 from datetime import datetime, timezone
 from functools import wraps
+import hashlib
 import json
 import math
 import os
@@ -15,6 +16,12 @@ import time
 from hermes_cli.execution_result import build_result, notification_required, render_result, validate_result, write_result
 
 _CONTEXT: ContextVar[dict | None] = ContextVar('cron_execution_result', default=None)
+
+
+def result_locale(job: dict) -> str:
+    """Rendering must remain available when another policy field is invalid."""
+    policy = job.get('execution_policy')
+    return 'pt-BR' if isinstance(policy, dict) and policy.get('locale') == 'pt-BR' else 'en'
 
 
 def policy_for(job: dict) -> dict:
@@ -91,6 +98,25 @@ def record_process(*, script: str, pid: int | None, exit_code: int | None,
             'duration_s':duration_s,'reason':reason})
 
 
+def record_dispatch_refusal(kind: str, *, already_alerted: bool = False) -> None:
+    context = _CONTEXT.get()
+    if context is not None and context['locale'] == 'pt-BR':
+        if kind not in ('configuration_refused', 'configuration_check_failed', 'inference_configuration_drift'):
+            raise ValueError('unsupported dispatch refusal')
+        context['dispatch_refusal'] = {'kind': kind, 'already_alerted': already_alerted}
+
+
+def dispatch_refusal(home: Path, execution_id: str, job_id: str) -> dict | None:
+    runtime = _read_receipt(_runtime_path(home, execution_id), execution_id, job_id=job_id)
+    refusal = runtime['metrics'].get('dispatch_refusal') if runtime else None
+    if refusal is None:
+        return None
+    if (not isinstance(refusal, dict) or type(refusal.get('already_alerted')) is not bool
+            or refusal.get('kind') not in ('configuration_refused', 'configuration_check_failed', 'inference_configuration_drift')):
+        raise ValueError('invalid dispatch refusal observation')
+    return refusal
+
+
 def _runtime_path(home: Path, execution_id: str) -> Path:
     return result_path(home,execution_id).parent.parent/'execution-observations'/f'{execution_id}.json'
 
@@ -113,6 +139,7 @@ def execution_scope(home_resolver):
             started = time.monotonic()
             context = {'deadline': started+budget if budget else None,
                 'started_at':datetime.now(timezone.utc).isoformat(), 'processes':[],
+                'locale': result_locale(job), 'dispatch_refusal': None,
                 'returned_success':None,
                 'environment': {'HERMES_EXECUTION_ID':execution_id, 'HERMES_JOB_ID':str(job['id']),
                                 'HERMES_RESULT_PATH':str(path)}}
@@ -149,7 +176,8 @@ def execution_scope(home_resolver):
                         started_at=context['started_at'],finished_at=datetime.now(timezone.utc).isoformat(),
                         duration_s=time.monotonic()-started,
                         reason={'code':'runtime_observed'},
-                        metrics={'processes':context['processes'],'returned_success':context['returned_success']},
+                        metrics={'processes':context['processes'],'returned_success':context['returned_success'],
+                                 **({'dispatch_refusal':context['dispatch_refusal']} if context['dispatch_refusal'] else {})},
                         policy={'wall_timeout_seconds':budget})
                     write_result(_runtime_path(home,execution_id),runtime)
                 finally:
@@ -159,13 +187,28 @@ def execution_scope(home_resolver):
 
 
 def ledger_result(home: Path, execution_id: str, job_id: str, *, delivery_outcome: str | None) -> dict:
+    missing = False
     try:
         result = read_result(home, execution_id, job_id=job_id)
         if result is None:
+            missing = True
             result = build_result(subject_type='job',execution_id=execution_id,job_id=job_id)
     except (OSError,ValueError) as exc:
         result = build_result(subject_type='job',execution_id=execution_id,job_id=job_id,
             reason={'code':'invalid_functional_result','detail':str(exc)})
+    failure_path = _scheduler_failure_path(home, execution_id)
+    try:
+        failure = _read_scheduler_failure(failure_path, execution_id, job_id)
+    except (OSError, ValueError) as exc:
+        result['metrics']['scheduler_failure_observation'] = {
+            'status': 'invalid', 'error_type': type(exc).__name__, 'path': str(failure_path)}
+        failure = None
+    if failure is not None:
+        if missing:
+            result = failure
+        result['metrics']['scheduler_failure'] = failure['metrics']['scheduler_failure']
+        result['evidence'].append({'path': str(failure_path), 'role': 'scheduler_failure',
+            'sha256': hashlib.sha256(failure_path.read_bytes()).hexdigest()})
     result['delivery']['status'] = delivery_outcome
     runtime_path = _runtime_path(home,execution_id)
     try:
@@ -181,6 +224,93 @@ def ledger_result(home: Path, execution_id: str, job_id: str, *, delivery_outcom
         result['metrics']['runtime'] = runtime['metrics']
         result['evidence'].append({'path':str(runtime_path),'role':'process_observation'})
     return validate_result(result)
+
+
+_SCHEDULER_FAILURES = {
+    'execution_failed': ('unknown', 'A execução terminou com falha; a conclusão funcional não foi comprovada.',
+                         'classificação da causa e verificação dos efeitos já executados'),
+    'scheduler_exception': ('unknown', 'O scheduler registrou uma exceção; a conclusão funcional precisa de evidência.',
+                            'correção da causa registrada e verificação dos efeitos já executados'),
+    'configuration_refused': ('skipped', 'A validação da configuração recusou a chamada ao modelo.',
+                              'configuração declarada válida e próxima oportunidade elegível'),
+    'configuration_check_failed': ('unknown', 'A verificação da configuração falhou; a chamada ao modelo não foi iniciada.',
+                                   'verificação da configuração disponível e próxima oportunidade elegível'),
+    'inference_configuration_drift': ('skipped', 'A configuração de inferência divergiu; o disparo foi recusado antes da chamada ao modelo.',
+                                      'reconciliação de modelo/provedor e próxima oportunidade elegível'),
+}
+
+
+def _scheduler_failure_path(home: Path, execution_id: str) -> Path:
+    return result_path(home, execution_id).parent.parent / 'scheduler-failures' / f'{execution_id}.json'
+
+
+def _read_scheduler_failure(path: Path, execution_id: str, job_id: str) -> dict | None:
+    value = _read_receipt(path, execution_id, job_id=job_id)
+    if value is None:
+        return None
+    failure = value['metrics'].get('scheduler_failure')
+    if (value['subject_type'] != 'job' or value['policy'].get('id') != 'hermes-scheduler-failure/v1'
+            or not isinstance(failure, dict) or failure.get('kind') not in _SCHEDULER_FAILURES
+            or failure.get('scheduler_status') != 'failed'
+            or value['outcome'] != _SCHEDULER_FAILURES[failure['kind']][0]):
+        raise ValueError('invalid scheduler failure observation')
+    return value
+
+
+def _failure_observation(job: dict, kind: str, execution_id: str | None = None) -> dict:
+    # Kind comes from the scheduler branch, never from opaque exception prose.
+    outcome, detail, continuation = _SCHEDULER_FAILURES[kind]
+    next_at = None
+    next_source = None
+    valid_clock = job.get('next_run_at') is None
+    raw = job.get('next_run_at')
+    if isinstance(raw, str):
+        try:
+            parsed = datetime.fromisoformat(raw.replace('Z', '+00:00'))
+            valid_clock = parsed.tzinfo is not None
+            if parsed.tzinfo is not None and parsed > datetime.now(timezone.utc):
+                next_at = parsed.isoformat()
+                next_source = 'persisted_schedule'
+        except ValueError:
+            pass
+    schedule = job.get('schedule')
+    recurring = isinstance(schedule, dict) and schedule.get('kind') in ('cron', 'interval')
+    if next_at is None and valid_clock and recurring and job.get('enabled') is True:
+        try:
+            from cron.jobs import compute_next_run
+            calculated = compute_next_run(schedule)
+            parsed = datetime.fromisoformat(calculated.replace('Z', '+00:00')) if calculated else None
+            if parsed is not None and parsed.tzinfo is not None and parsed > datetime.now(timezone.utc):
+                next_at = parsed.isoformat()
+                next_source = 'canonical_scheduler_calculation'
+        except (OSError, ValueError, TypeError, OverflowError, ImportError):
+            pass
+    name = str(job.get('name') or job.get('id') or 'Job')[:100]
+    return build_result(subject_type='job', outcome=outcome,
+        execution_id=execution_id, job_id=str(job['id']) if job.get('id') else None,
+        reason={'code': kind, 'detail': name + ': ' + detail},
+        metrics={'next_opportunity_source': next_source,
+                 'scheduler_failure': {'kind': kind, 'scheduler_status': 'failed',
+                                      'inference_attempted': False if kind in ('configuration_refused', 'configuration_check_failed', 'inference_configuration_drift') else None}},
+        continuation={'condition': continuation, 'eligible_at': next_at,
+                      'automatic': True if recurring and job.get('enabled') is True else None},
+        policy={'id': 'hermes-scheduler-failure/v1'})
+
+
+def unattributed_failure_message(job: dict) -> str:
+    """Emergency rendering without an execution identity; no cause is inferred."""
+    return render_result(_failure_observation(job, 'execution_failed'), locale='pt-BR')
+
+
+def scheduler_failure_message(home: Path, execution_id: str, job: dict, *, kind: str) -> str | None:
+    if result_locale(job) != 'pt-BR':
+        return failure_message(home, execution_id, job)
+    path = _scheduler_failure_path(home, execution_id)
+    previous = _read_scheduler_failure(path, execution_id, str(job['id']))
+    if previous is None:
+        write_result(path, _failure_observation(job, kind, execution_id))
+    result = ledger_result(home, execution_id, str(job['id']), delivery_outcome=None)
+    return render_result(result, locale='pt-BR')
 
 
 def failure_message(home: Path, execution_id: str, job: dict) -> str | None:
