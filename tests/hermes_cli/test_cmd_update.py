@@ -85,11 +85,14 @@ def _patch_gateway_discovery():
     an unmocked ``find_gateway_pids`` on a box with a live gateway reaches the
     conftest live-system guard and turns into a spurious ``sys.exit(1)``.
     Discovery returning nothing makes the phase a clean no-op for every test
-    in this module (none of them assert on gateway restarts).
+    in this module (none of them assert on gateway restarts). The module purge
+    has dedicated tests; letting it evict the patched gateway module here
+    reimports real discovery and defeats this fixture during the restart phase.
     """
     with patch("hermes_cli.gateway.find_gateway_pids", return_value=[]), \
          patch("hermes_cli.gateway.supports_systemd_services", return_value=False), \
-         patch("hermes_cli.gateway.find_profile_gateway_processes", return_value=[]):
+         patch("hermes_cli.gateway.find_profile_gateway_processes", return_value=[]), \
+         patch("hermes_cli.main._purge_stale_hermes_modules"):
         yield
 
 
