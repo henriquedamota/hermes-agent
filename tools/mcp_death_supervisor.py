@@ -93,16 +93,23 @@ _MAX_STATUS_BYTES = 64 * 1024
 
 def process_identity(pid: int) -> dict:
     """Linux process identity; an unreadable/reused process is never proof."""
-    fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+    fields = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").rsplit(")", 1)[1].split()
     return {"pid": pid, "ppid": int(fields[1]), "pgid": int(fields[2]),
             "start_ticks": int(fields[19]),
-            "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip()}
+            "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text(encoding="utf-8").strip()}
+
+
+def _linux_uid() -> int:
+    getuid = getattr(os, "getuid", None)
+    if sys.platform != "linux" or getuid is None:
+        raise OSError("coverage peer authentication requires Linux UID support")
+    return getuid()
 
 
 def _status_address(pid: int) -> str:
     # Linux abstract sockets disappear with their owner. No stale file, path
     # truncation or cross-profile filesystem state; peer credentials are checked.
-    return f"\0hermes-mcp-supervisor-{os.getuid()}-{pid}"
+    return f"\0hermes-mcp-supervisor-{_linux_uid()}-{pid}"
 
 
 class CoverageStatus:
@@ -161,7 +168,7 @@ class CoverageStatus:
                     connection.settimeout(0.25)
                     _, uid, _ = struct.unpack("3i", connection.getsockopt(
                         socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")))
-                    if uid != os.getuid():
+                    if uid != _linux_uid():
                         continue
                     nonce = connection.recv(128).decode("ascii")
                     if len(nonce) != 32 or any(c not in "0123456789abcdef" for c in nonce):
@@ -199,7 +206,7 @@ def query_coverage(pid: int, timeout: float = 1.0) -> dict:
         client.connect(_status_address(pid))
         peer_pid, uid, _ = struct.unpack("3i", client.getsockopt(
             socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")))
-        if peer_pid != pid or uid != os.getuid():
+        if peer_pid != pid or uid != _linux_uid():
             raise ValueError("supervisor peer identity mismatch")
         client.sendall(nonce.encode())
         raw = client.recv(_MAX_STATUS_BYTES + 1)
