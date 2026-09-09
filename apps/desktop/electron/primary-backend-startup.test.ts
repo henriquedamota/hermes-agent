@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 
 import { test, vi } from 'vitest'
 
+import { createBackendShutdownCoordinator } from './backend-ownership'
 import { createFirstRunSetupGate } from './first-run-setup-gate'
 import {
   createPrimaryRemoteConnection,
@@ -171,5 +172,46 @@ test('reset rejects with a typed error and never enters either backend', async (
 
   await assert.rejects(pending, error => error instanceof FirstRunSetupResetError && error.firstRunSetupReset)
   assert.equal(options.connectRemote.mock.calls.length, 0)
+  assert.equal(options.ensureLocalRuntime.mock.calls.length, 0)
+})
+
+
+test('accepted quit prevents startup side effects before asynchronous teardown runs', async () => {
+  const teardown = vi.fn(async () => {})
+  const shutdown = createBackendShutdownCoordinator(teardown)
+
+  const options = startupOptions({
+    assertActive: () => {
+      if (shutdown.hasStarted()) {throw new Error('startup canceled')}
+    }
+  })
+
+  const stopped = shutdown.run()
+
+  assert.equal(teardown.mock.calls.length, 0)
+  await assert.rejects(runPrimaryBackendStartup(options), /startup canceled/)
+  assert.equal(options.resolveRemote.mock.calls.length, 0)
+  assert.equal(options.prepareLocalBackend.mock.calls.length, 0)
+  assert.equal(options.ensureLocalRuntime.mock.calls.length, 0)
+  await stopped
+})
+
+test('quit during remote resolution cannot fall through to local installation', async () => {
+  const shutdown = createBackendShutdownCoordinator(async () => {})
+
+  const options = startupOptions({
+    assertActive: () => {
+      if (shutdown.hasStarted()) {throw new Error('startup canceled')}
+    },
+    resolveRemote: vi.fn(async () => {
+      void shutdown.run()
+
+      return null
+    })
+  })
+
+  await assert.rejects(runPrimaryBackendStartup(options), /startup canceled/)
+  assert.equal(options.waitForLocalStart.mock.calls.length, 0)
+  assert.equal(options.prepareLocalBackend.mock.calls.length, 0)
   assert.equal(options.ensureLocalRuntime.mock.calls.length, 0)
 })

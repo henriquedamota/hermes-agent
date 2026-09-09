@@ -356,7 +356,7 @@ import {
   SESSION_WINDOW_MIN_HEIGHT,
   SESSION_WINDOW_MIN_WIDTH
 } from './session-windows'
-import { ensureLoginShellPath } from './shell-path'
+import { cancelLoginShellPath, ensureLoginShellPath } from './shell-path'
 import { createBootstrapCoordinator, sshConfigFingerprint } from './ssh-bootstrap-coordinator'
 import { collectSshConfigHosts, parseSshGOutput } from './ssh-config'
 import { createSshProbeConnection, pickLocalPort, redactSecrets, SshConnection } from './ssh-connection'
@@ -12752,23 +12752,28 @@ async function startHermes() {
   // a local failure latches to break install-restart loops.
   let attemptedRemote = managedPrimaryRestoreOwners.size > 0 || primaryBackendIsRemote()
 
+  // Quit seals startup synchronously, even before asynchronous teardown has
+  // invalidated the connection generation. PATH cancellation must not resume
+  // a local install or spawn while the app is shutting down.
+  const assertStartupActive = () => {
+    if (backendShutdown.hasStarted() || !backendConnectionState.isCurrentAttempt(connectionAttempt)) {
+      throw new Error('Hermes backend start was canceled or superseded by a newer connection attempt.')
+    }
+  }
+
   const connectionPromise = (async () => {
     const connectRemote = async remote => {
       // resolveRemote() may take arbitrarily long (settings resolve / ws-ticket
       // mint). If a newer attempt started meanwhile (e.g. the user switched
       // remotes and Apply invalidated this attempt), bail before probing.
-      if (!backendConnectionState.isCurrentAttempt(connectionAttempt)) {
-        throw new Error('Hermes backend start was superseded by a newer connection attempt.')
-      }
+      assertStartupActive()
 
       await advanceBootProgress('backend.remote', `Connecting to remote Hermes backend at ${remote.baseUrl}`, 24)
       await waitForHermes(remote.baseUrl, remote.token, undefined, remote.authMode, remote.headers)
 
       // Second async boundary: the health probe itself can outlive the
       // attempt. A late success here must not publish a stale descriptor.
-      if (!backendConnectionState.isCurrentAttempt(connectionAttempt)) {
-        throw new Error('Hermes backend start was superseded by a newer connection attempt.')
-      }
+      assertStartupActive()
 
       updateBootProgress({
         phase: 'backend.ready',
@@ -12815,6 +12820,7 @@ async function startHermes() {
     }
 
     const setup = await runPrimaryBackendStartup({
+      assertActive: assertStartupActive,
       connectRemote,
       ensureLocalRuntime: ensureRuntime,
       prepareLocalBackend: async () => {
@@ -12860,6 +12866,7 @@ async function startHermes() {
 
     const profile = primaryProfileKey()
     const parentStartMarker = await desktopParentStartMarker()
+    assertStartupActive()
     const backendNonce = crypto.randomBytes(16).toString('hex')
     const parentIdentityEnv = parentWatchdogEnv(process.pid, parentStartMarker, backendNonce)
 
@@ -18051,6 +18058,7 @@ app.on('before-quit', event => {
   // Seal the SSH coordinator before touching connections so reconnect
   // callbacks cannot recreate a backend for a registration whose app is
   // already quitting (#91668).
+  cancelLoginShellPath()
   sshBootstrapCoordinator.shutdown()
 
   if (!backendQuitTeardownDone) {

@@ -1,4 +1,4 @@
-import { execFile } from 'node:child_process'
+import { spawn } from 'node:child_process'
 
 import { appendUniquePathEntries, delimiterForPlatform, pathEnvKey } from './backend-env'
 
@@ -67,31 +67,96 @@ function mergeLoginShellPath(loginPath, currentPath, { delimiter = ':' }: any = 
   return appendUniquePathEntries([loginPath, currentPath], { delimiter })
 }
 
-function runProbe(shell, flags, execFileFn, timeoutMs): Promise<string | null> {
+// Cancellation seals startup resolution when the app accepts a quit. A canceled
+// resolution must not create its fallback shell or mutate PATH afterwards.
+let probeLifetime = new AbortController()
+
+function cancelLoginShellPath() {
+  probeLifetime.abort()
+}
+
+function runProbe(shell, flags, spawnFn, timeoutMs, signal: AbortSignal): Promise<string | null> {
   return new Promise(resolve => {
     let settled = false
+    let child: ReturnType<typeof spawn> | undefined
+    let timer: ReturnType<typeof setTimeout> | undefined
+    let stdout = ''
+    let outputBytes = 0
 
-    const finish = value => {
-      if (!settled) {
-        settled = true
+    const collectChild = () => {
+      // spawn (unlike execFile) forwards detached:true and creates a private
+      // POSIX process group. Collect descendants holding inherited pipes too.
+      if (child?.pid) {
+        try {
+          process.kill(-child.pid, 'SIGKILL')
+        } catch (error) {
+          if (error?.code !== 'ESRCH') {
+            console.warn('[login-shell PATH] process group cleanup failed:', error?.code || 'unknown')
+          }
+
+          try {
+            child.kill('SIGKILL')
+          } catch {
+            // The process may already have exited.
+          }
+        }
+      }
+
+      child?.stdin?.destroy?.()
+      child?.stdout?.destroy?.()
+      child?.stderr?.destroy?.()
+    }
+
+    const finish = (value: string | null) => {
+      if (settled) {return}
+      settled = true
+      clearTimeout(timer)
+      signal.removeEventListener('abort', cancel)
+
+      try {
+        collectChild()
+      } finally {
         resolve(value)
       }
     }
 
-    try {
-      const child = execFileFn(
-        shell,
-        [...flags, PROBE_COMMAND],
-        { encoding: 'utf8', timeout: timeoutMs, windowsHide: true },
-        (_error, stdout) => {
-          // A profile script may exit nonzero after the sentinel already
-          // printed — trust the sentinel, not the exit code.
-          finish(extractSentinelPath(stdout))
-        }
-      )
+    const cancel = () => finish(null)
 
-      // Interactive shells with a broken rc can block reading stdin.
-      child?.stdin?.end?.()
+    if (signal.aborted) {
+      finish(null)
+
+      return
+    }
+
+    signal.addEventListener('abort', cancel, { once: true })
+    // execFile's timeout only sends a signal and may never invoke its callback.
+    // Own the wall deadline independently of exit/close and pipe completion.
+    timer = setTimeout(() => {
+      console.warn('[login-shell PATH] probe wall deadline exceeded:', timeoutMs)
+      cancel()
+    }, timeoutMs)
+
+    try {
+      child = spawnFn(shell, [...flags, PROBE_COMMAND], { detached: true, windowsHide: true })
+      child.on('error', cancel)
+      child.on('close', () => finish(extractSentinelPath(stdout)))
+      child.stdout?.setEncoding('utf8')
+      child.stdout?.on('data', data => {
+        if (settled) {return}
+        outputBytes += Buffer.byteLength(data)
+
+        // Preserve the previous execFile output bound without retaining banners
+        // indefinitely. Overflow cannot authenticate a partial sentinel.
+        if (outputBytes > 1024 * 1024) {
+          cancel()
+
+          return
+        }
+
+        stdout += data
+      })
+      child.stderr?.resume()
+      child.stdin?.end()
     } catch {
       finish(null)
     }
@@ -101,7 +166,7 @@ function runProbe(shell, flags, execFileFn, timeoutMs): Promise<string | null> {
 async function captureLoginShellPath({
   env = process.env,
   platform = process.platform,
-  execFileFn = execFile,
+  spawnFn = spawn,
   timeoutMs = ATTEMPT_TIMEOUT_MS
 }: any = {}) {
   if (platform === 'win32') {
@@ -110,6 +175,7 @@ async function captureLoginShellPath({
     return null
   }
 
+  const signal = probeLifetime.signal
   const shell = loginShellExecutable(env, platform)
 
   // -l sources ~/.zprofile / ~/.profile (where `brew shellenv` lives); -i
@@ -118,7 +184,8 @@ async function captureLoginShellPath({
   // — see tests/tools/test_find_shell.py), so fall back to a plain login
   // shell before giving up.
   for (const flags of [['-ilc'], ['-lc']]) {
-    const captured = await runProbe(shell, flags, execFileFn, timeoutMs)
+    if (signal.aborted) {return null}
+    const captured = await runProbe(shell, flags, spawnFn, timeoutMs, signal)
 
     if (captured) {
       return captured
@@ -131,16 +198,16 @@ async function captureLoginShellPath({
 async function applyLoginShellPath({
   env = process.env,
   platform = process.platform,
-  execFileFn = execFile,
+  spawnFn = spawn,
   timeoutMs = ATTEMPT_TIMEOUT_MS
 }: any = {}) {
   if (platform === 'win32') {
     return { applied: false, reason: 'win32' }
   }
 
-  const loginPath = await captureLoginShellPath({ env, platform, execFileFn, timeoutMs })
+  const loginPath = await captureLoginShellPath({ env, platform, spawnFn, timeoutMs })
 
-  if (!loginPath) {
+  if (!loginPath || probeLifetime.signal.aborted) {
     return { applied: false, reason: 'unresolved' }
   }
 
@@ -173,11 +240,14 @@ function ensureLoginShellPath(options: any = {}) {
 }
 
 function resetLoginShellPathForTests() {
+  cancelLoginShellPath()
+  probeLifetime = new AbortController()
   _ensurePromise = null
 }
 
 export {
   applyLoginShellPath,
+  cancelLoginShellPath,
   captureLoginShellPath,
   ensureLoginShellPath,
   extractSentinelPath,

@@ -1,6 +1,7 @@
 import type { FirstRunSetupDecision } from './first-run-setup-gate'
 
 export interface PrimaryBackendStartupOptions<Backend, RuntimeBackend, Remote, Connection> {
+  assertActive?: () => void
   connectRemote: (remote: Remote) => Promise<Connection>
   ensureLocalRuntime: (backend: Backend) => Promise<RuntimeBackend>
   prepareLocalBackend: () => Backend | Promise<Backend>
@@ -75,6 +76,7 @@ export class FirstRunSetupResetError extends Error {
 // and local backend resolution happen before the setup gate, and a remote Apply
 // re-resolves persisted config without ever entering ensureRuntime/bootstrap.
 export async function runPrimaryBackendStartup<Backend, RuntimeBackend, Remote, Connection>({
+  assertActive,
   connectRemote,
   ensureLocalRuntime,
   prepareLocalBackend,
@@ -84,19 +86,25 @@ export async function runPrimaryBackendStartup<Backend, RuntimeBackend, Remote, 
 }: PrimaryBackendStartupOptions<Backend, RuntimeBackend, Remote, Connection>): Promise<
   PrimaryBackendStartupResult<RuntimeBackend, Connection>
 > {
+  assertActive?.()
   const savedRemote = await resolveRemote()
+  assertActive?.()
 
   if (savedRemote) {
     return { kind: 'remote', connection: await connectRemote(savedRemote) }
   }
 
   await waitForLocalStart()
+  assertActive?.()
 
   const backend = await prepareLocalBackend()
+  assertActive?.()
   const decision = await waitForDecision(backend)
+  assertActive?.()
 
   if (decision === 'remote-applied') {
     const appliedRemote = await resolveRemote()
+    assertActive?.()
 
     if (!appliedRemote) {
       throw new Error('First-run remote setup completed without a saved remote backend.')
@@ -109,5 +117,8 @@ export async function runPrimaryBackendStartup<Backend, RuntimeBackend, Remote, 
     throw new FirstRunSetupResetError()
   }
 
-  return { kind: 'local', backend: await ensureLocalRuntime(backend) }
+  const runtime = await ensureLocalRuntime(backend)
+  assertActive?.()
+
+  return { kind: 'local', backend: runtime }
 }
