@@ -2844,6 +2844,11 @@ def resume_job(job_id: str) -> Optional[Dict[str, Any]]:
         return None
 
     next_run_at = compute_next_run(job["schedule"])
+    continuation_at = _pending_continuation_at(job)
+    if continuation_at is not None and (
+        next_run_at is None or continuation_at < _ensure_aware(datetime.fromisoformat(next_run_at))
+    ):
+        next_run_at = continuation_at.isoformat()
     if next_run_at is None and job["schedule"].get("kind") == "once":
         run_at = job["schedule"].get("run_at", "unknown")
         raise ValueError(
@@ -3851,6 +3856,43 @@ def get_due_jobs() -> List[Dict[str, Any]]:
         return _get_due_jobs_locked()
 
 
+def _pending_continuation_at(job: Dict[str, Any]) -> Optional[datetime]:
+    """Return a receipt-backed absolute opportunity, independent of cron time.
+
+    A newer execution consumes this opportunity even if the process crashed or
+    delivery failed. The old waiting result must never replay those effects.
+    Conversely, advancing the schedule before dispatch is not consumption: if
+    no successor was created, restart must still find the unfinished work.
+    """
+    pending = job.get('continuation')
+    if not isinstance(pending, dict) or pending.get('automatic') is not True:
+        return None
+    if job.get('last_functional_outcome') not in ('deferred', 'partial'):
+        return None
+    from cron.executions import latest_execution
+    from hermes_cli.execution_result import validate_result
+
+    latest = latest_execution(job['id'])
+    if not latest or latest['id'] != pending.get('execution_id'):
+        return None
+    if latest['status'] not in ('completed', 'failed'):
+        return None
+    try:
+        result = validate_result(json.loads(latest.get('functional_result_json') or 'null'),
+                                 expected_execution_id=latest['id'])
+        if (result['job_id'] != job['id'] or result['outcome'] not in ('deferred', 'partial')
+                or result['continuation'].get('automatic') is not True):
+            return None
+        eligible = datetime.fromisoformat(pending['eligible_at'].replace('Z', '+00:00'))
+        original = datetime.fromisoformat(result['continuation']['eligible_at'].replace('Z', '+00:00'))
+        if eligible.tzinfo is None or eligible.utcoffset() is None or eligible < original:
+            raise ValueError('continuation must retain its absolute not-before time')
+        return eligible
+    except (AttributeError, KeyError, TypeError, ValueError) as exc:
+        logger.warning('Ignoring invalid continuation for job %s: %s', job['id'], exc)
+        return None
+
+
 def _get_due_jobs_locked() -> List[Dict[str, Any]]:
     """Inner implementation of get_due_jobs(); must be called with _jobs_lock held."""
     now = _hermes_now()
@@ -4026,6 +4068,18 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
                     pass  # malformed claim → fall through and (re)claim
 
             next_run = job.get("next_run_at")
+            manual_run = bool(next_run and job.get('manual_run_at') == next_run)
+            continuation_at = None if manual_run else _pending_continuation_at(job)
+            if continuation_at is not None and (
+                not next_run or continuation_at < _ensure_aware(datetime.fromisoformat(next_run))
+            ):
+                next_run = continuation_at.isoformat()
+                job['next_run_at'] = next_run
+                for rj in raw_jobs:
+                    if rj['id'] == job['id']:
+                        rj['next_run_at'] = next_run
+                        needs_save = True
+                        break
             if not next_run:
                 schedule = job.get("schedule", {})
                 kind = schedule.get("kind")
@@ -4076,6 +4130,7 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
             # recovery re-anchor, fire-claim advance) must invalidate the
             # marker. Do not "fix" this with _ensure_aware normalization.
             manual_run = job.get("manual_run_at") == next_run
+            continuation_run = continuation_at is not None and continuation_at == next_run_dt
             # Migration repair: a cron job persists next_run_at as an absolute
             # instant, but the cron expr describes local wall-clock intent. If the
             # configured/system timezone changed after persistence, the stored
@@ -4094,6 +4149,7 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
             if (
                 kind == "cron"
                 and not manual_run
+                and not continuation_run
                 and next_run_dt <= now
                 and _timezone_offset_mismatch(raw_next_run_dt, now)
                 and _stored_wall_clock_is_future(raw_next_run_dt, now)
@@ -4188,7 +4244,7 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
                 # occurrence. Classify first, and only the edit case skips.
                 stale_class = (
                     _classify_stale_cron_next_run(schedule, raw_next_run_dt, next_run_dt)
-                    if not manual_run and kind == "cron"
+                    if not manual_run and not continuation_run and kind == "cron"
                     else STALE_CRON_MATCH
                 )
                 if stale_class == STALE_CRON_EXPR_EDIT:
@@ -4277,7 +4333,8 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
                 # them — only the due-scan acted differently and dispatched a
                 # wall-clock one-shot hours late (gateway down past the
                 # window, host asleep, hand-edited jobs.json).
-                if kind == "once" and (now - next_run_dt).total_seconds() > ONESHOT_GRACE_SECONDS:
+                if (kind == "once" and not continuation_run
+                        and (now - next_run_dt).total_seconds() > ONESHOT_GRACE_SECONDS):
                     if not (job.get("run_claim") or job.get("fire_claim")):
                         # Nothing was ever dispatched — retire the record with
                         # a diagnostic so it stops being scanned and the miss

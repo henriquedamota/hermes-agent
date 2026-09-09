@@ -1,9 +1,142 @@
 """A process return must neither heal a deferred failure nor lose its next chance."""
 from datetime import datetime, timedelta, timezone
+import json
+from zoneinfo import ZoneInfo
 
 import pytest
 from cron import jobs
 from hermes_cli.execution_result import build_result
+
+
+def persist_wait(job, now, monkeypatch, *, minutes=5):
+    """Use the same receipt, ledger and job completion path as a real producer."""
+    from cron import executions, functional_results
+    monkeypatch.setattr(jobs, '_hermes_now', lambda: now)
+    entry = executions.create_execution(job['id'], source='isolated')
+    result = build_result(subject_type='maintenance', job_id=job['id'],
+        execution_id=entry['id'], outcome='deferred', exit_code=0,
+        observed_at=now.isoformat(), reason={'code':'writer_busy'},
+        continuation={'automatic':True, 'eligible_at':(now+timedelta(minutes=minutes)).astimezone(timezone.utc).isoformat()})
+    path = functional_results.result_path(executions.get_hermes_home(), entry['id'])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(result))
+    jobs.mark_job_run(job['id'], True, functional_result=result)
+    executions.finish_execution(entry['id'], success=True)
+    return result
+
+
+@pytest.mark.parametrize('zone', ['UTC', 'America/Sao_Paulo'])
+@pytest.mark.parametrize('delay_minutes', [5, 180])
+def test_daily_continuation_is_dispatched_off_cron_grid_after_reload(job, monkeypatch, zone, delay_minutes):
+    now = datetime(2026, 9, 9, 5, 20, 20, tzinfo=ZoneInfo(zone))
+    persist_wait(job, now, monkeypatch)
+    monkeypatch.setattr(jobs, '_hermes_now', lambda: now+timedelta(minutes=delay_minutes))
+    due = jobs.get_due_jobs()
+    assert [row['id'] for row in due] == [job['id']]
+    assert due[0]['last_dispatch']['scheduled_at'] == jobs.get_job(job['id'])['continuation']['eligible_at']
+
+
+@pytest.mark.parametrize('lost_next', [None, '2026-09-10T12:00:00+00:00'])
+def test_pending_receipt_repairs_next_opportunity_without_manual_rearm(job, monkeypatch, lost_next):
+    now = datetime(2026, 9, 9, 5, 20, 20, tzinfo=timezone.utc)
+    persist_wait(job, now, monkeypatch)
+    records = jobs.load_jobs()
+    records[0]['next_run_at'] = lost_next  # legacy scheduler rewrite / interrupted dispatch
+    jobs.save_jobs(records)
+    monkeypatch.setattr(jobs, '_hermes_now', lambda: now+timedelta(minutes=6))
+    assert [row['id'] for row in jobs.get_due_jobs()] == [job['id']]
+
+
+@pytest.mark.parametrize('successor_status', ['claimed', 'running', 'unknown', 'completed'])
+def test_old_wait_cannot_replay_after_a_successor_attempt(job, monkeypatch, successor_status):
+    from cron import executions
+    now = datetime(2026, 9, 9, 5, 20, 20, tzinfo=timezone.utc)
+    persist_wait(job, now, monkeypatch)
+    jobs.advance_next_run(job['id'])
+    monkeypatch.setattr(executions, '_hermes_now', lambda: now-timedelta(hours=1))
+    newer = executions.create_execution(job['id'], source='isolated')
+    if successor_status == 'running':
+        executions.mark_execution_running(newer['id'])
+    elif successor_status == 'unknown':
+        monkeypatch.setattr(executions, '_owner_is_live', lambda *_: False)
+        executions.recover_interrupted_executions()
+    elif successor_status == 'completed':
+        executions.finish_execution(newer['id'], success=True, delivery_outcome='failed')
+    monkeypatch.setattr(jobs, '_hermes_now', lambda: now+timedelta(minutes=6))
+    assert jobs.get_due_jobs() == []
+
+
+def test_continuation_waits_for_absolute_time_and_respects_pause(job, monkeypatch):
+    now = datetime(2026, 9, 9, 5, 20, 20, tzinfo=ZoneInfo('America/Sao_Paulo'))
+    persist_wait(job, now, monkeypatch)
+    monkeypatch.setattr(jobs, '_hermes_now', lambda: now+timedelta(minutes=4))
+    assert jobs.get_due_jobs() == []
+    jobs.pause_job(job['id'], 'isolated maintenance')
+    monkeypatch.setattr(jobs, '_hermes_now', lambda: now+timedelta(minutes=6))
+    assert jobs.get_due_jobs() == []
+    jobs.resume_job(job['id'])
+    assert [row['id'] for row in jobs.get_due_jobs()] == [job['id']]
+
+
+def test_late_oneshot_continuation_keeps_dispatch_budget(job, monkeypatch):
+    now = datetime(2026, 9, 9, 5, 20, 20, tzinfo=timezone.utc)
+    monkeypatch.setattr(jobs, '_hermes_now', lambda: now)
+    task = jobs.create_job('isolated one-shot', (now+timedelta(minutes=1)).isoformat(), deliver='local')
+    assert jobs.claim_dispatch(task['id'])
+    persist_wait(task, now, monkeypatch)
+    monkeypatch.setattr(jobs, '_hermes_now', lambda: now+timedelta(hours=3))
+    due = jobs.get_due_jobs()
+    assert [row['id'] for row in due] == [task['id']]
+    assert jobs.get_due_jobs() == []  # durable one-shot claim prevents a duplicate tick
+    assert jobs.claim_dispatch(task['id'])
+    assert jobs.get_job(task['id'])['repeat']['completed'] == 1
+
+
+def test_resume_preserves_verified_oneshot_continuation_after_original_time(job, monkeypatch):
+    now = datetime(2026, 9, 9, 5, 20, 20, tzinfo=timezone.utc)
+    monkeypatch.setattr(jobs, '_hermes_now', lambda: now)
+    task = jobs.create_job('isolated resumable one-shot', (now+timedelta(minutes=1)).isoformat(), deliver='local')
+    jobs.claim_dispatch(task['id'])
+    result = persist_wait(task, now, monkeypatch)
+    jobs.pause_job(task['id'], 'isolated maintenance')
+    monkeypatch.setattr(jobs, '_hermes_now', lambda: now+timedelta(hours=3))
+    resumed = jobs.resume_job(task['id'])
+    assert resumed['next_run_at'] == result['continuation']['eligible_at']
+    assert [row['id'] for row in jobs.get_due_jobs()] == [task['id']]
+
+
+@pytest.mark.parametrize('invalid', ['invalid', '2026-09-09T05:25:20', '2026-09-09T05:21:20+00:00'])
+def test_invalid_pending_timestamp_cannot_override_regular_schedule(job, monkeypatch, invalid):
+    now = datetime(2026, 9, 9, 5, 20, 20, tzinfo=timezone.utc)
+    persist_wait(job, now, monkeypatch)
+    jobs.advance_next_run(job['id'])
+    records = jobs.load_jobs()
+    records[0]['continuation']['eligible_at'] = invalid
+    jobs.save_jobs(records)
+    monkeypatch.setattr(jobs, '_hermes_now', lambda: now+timedelta(minutes=6))
+    assert jobs.get_due_jobs() == []
+
+
+def test_pending_summary_without_ledger_receipt_cannot_override_schedule(job, monkeypatch):
+    now = datetime(2026, 9, 9, 5, 20, 20, tzinfo=timezone.utc)
+    monkeypatch.setattr(jobs, '_hermes_now', lambda: now)
+    jobs.mark_job_run(job['id'], True, functional_result=receipt(job,
+        observed_at=now.isoformat(), continuation={'automatic':True,
+            'eligible_at':(now+timedelta(minutes=5)).isoformat()}))
+    jobs.advance_next_run(job['id'])
+    monkeypatch.setattr(jobs, '_hermes_now', lambda: now+timedelta(minutes=6))
+    assert jobs.get_due_jobs() == []
+
+
+def test_competing_fire_claims_cannot_dispatch_same_continuation(job, monkeypatch):
+    now = datetime(2026, 9, 9, 5, 20, 20, tzinfo=timezone.utc)
+    persist_wait(job, now, monkeypatch)
+    monkeypatch.setattr(jobs, '_hermes_now', lambda: now+timedelta(minutes=6))
+    assert [row['id'] for row in jobs.get_due_jobs()] == [job['id']]
+    first = jobs.claim_job_for_fire(job['id'], return_job=True)
+    assert first and first['fire_claim']['by']
+    monkeypatch.setattr(jobs, '_machine_id', lambda: 'competing-process')
+    assert jobs.claim_job_for_fire(job['id'], return_job=True) is False
 
 
 @pytest.fixture
