@@ -13312,6 +13312,8 @@ def _get_cron_job_sync(job_id: str, profile: Optional[str] = None):
     job = _call_cron_for_profile(selected, "get_job", job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+    from cron.result_export import last_result
+    job['last_result'] = last_result(job)
     return job
 
 
