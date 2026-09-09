@@ -581,9 +581,10 @@ def kill_process_tree(pid: int, *, sig: Optional[int] = None) -> bool:
       Windows has no equivalent). Console-window flash is suppressed via
       ``windows_hide_flags`` and the exit code is checked, so a dead or
       inaccessible PID reports ``False`` like the POSIX path.
-    * POSIX: the descendant set is snapshotted via psutil (a hard
-      dependency) BEFORE any signal — once the parent dies its children are
-      reparented and can no longer be found by a parent walk. Then the
+    * POSIX: hard cancellation first stops the root and discovered descendants,
+      then rescans via psutil before any terminating signal. This includes
+      children born during an earlier snapshot. Once the parent dies its children
+      are reparented and can no longer be found by a parent walk. Then the
       process group is signalled when ``pid`` leads one (covers
       grandchildren in the same session in one syscall), and every
       snapshotted descendant is signalled individually — which also reaches
@@ -625,49 +626,76 @@ def kill_process_tree(pid: int, *, sig: Optional[int] = None) -> bool:
     if sig is None:
         sig = _signal.SIGKILL
 
-    # Snapshot descendants while the parent is still alive — after it dies
-    # they reparent to init/subreaper and a parent walk finds nothing.
+    # Freeze a hard-cancelled tree before destroying its ancestry. A process
+    # born while psutil enumerates /proc can be absent from the first snapshot.
+    # Stop newly discovered parents and rescan until no new identities remain.
+    # Explicit graceful signals retain their previous semantics.
     descendants: list = []
+    frozen: list = []
+    parent = None
     try:
         import psutil
 
-        descendants = psutil.Process(int(pid)).children(recursive=True)
+        parent = psutil.Process(int(pid))
+        if sig == _signal.SIGKILL:
+            known = {parent: parent}
+            pending = [parent]
+            scan_deadline = time.monotonic() + 2.0
+            for _ in range(32):
+                for process in pending:
+                    try:
+                        was_stopped = process.status() == psutil.STATUS_STOPPED
+                        process.suspend()  # identity-aware PID + creation time
+                        if not was_stopped:
+                            frozen.append(process)
+                    except psutil.Error:
+                        continue
+                snapshot = parent.children(recursive=True)
+                pending = [process for process in snapshot if process not in known]
+                known.update((process, process) for process in pending)
+                descendants = [process for process in known if process != parent]
+                if not pending:
+                    break
+                if time.monotonic() >= scan_deadline:
+                    logger.warning("kill_process_tree: descendant scan budget exhausted for pid %s", pid)
+                    break
+            else:
+                logger.warning("kill_process_tree: descendant scan limit exhausted for pid %s", pid)
+        else:
+            descendants = parent.children(recursive=True)
     except Exception:
-        # Already gone, or psutil unavailable in a stripped env — the
-        # group-signal below still covers same-session descendants.
-        descendants = []
+        logger.debug("kill_process_tree: descendant observation failed for pid %s", pid, exc_info=True)
 
     signalled = False
     try:
-        # NOTE: getpgid→killpg has an inherent TOCTOU (pid could be reaped and
-        # recycled between the calls). All existing killpg sites share it; the
-        # psutil sweep below is identity-aware and does not.
-        pgid = os.getpgid(pid)
-    except (ProcessLookupError, PermissionError, OSError):
-        pgid = None
-    try:
-        if pgid is not None and pgid == pid:
-            # pid leads its own group: one syscall covers the whole group.
-            # (The == check guards against signalling the caller's own group
-            # when pid is not a leader.)
-            os.killpg(  # windows-footgun: ok — POSIX-only branch (win32 returns above)
-                pgid, sig
-            )
-        else:
-            os.kill(pid, sig)
-        signalled = True
-    except ProcessLookupError:
-        pass
-    except (PermissionError, OSError):
-        logger.debug("kill_process_tree: signal failed for pid %s", pid, exc_info=True)
-
-    # Sweep the snapshot: reaches descendants outside the parent's group
-    # (their own setsid sessions) and the non-group-leader case.
-    for child in descendants:
+        # Signal captured identities before destroying the root's ancestry.
+        for child in descendants:
+            try:
+                if child.is_running():
+                    child.send_signal(sig)
+                    signalled = True
+            except Exception:
+                continue
         try:
-            if child.is_running():  # identity-aware: recycled PIDs skipped
-                child.send_signal(sig)
-                signalled = True
+            # A frozen, identity-checked group leader cannot itself fork or
+            # recycle during observation. psutil also guards the single-PID path.
+            if parent is None or not parent.is_running():
+                return signalled
+            pgid = os.getpgid(pid)
+            if pgid == pid:
+                os.killpg(pgid, sig)  # windows-footgun: ok — POSIX-only branch
+            else:
+                parent.send_signal(sig)
+            signalled = True
         except Exception:
-            continue
-    return signalled
+            logger.debug("kill_process_tree: signal failed for pid %s", pid, exc_info=True)
+        return signalled
+    finally:
+        # If signalling failed, never strand a process stopped by this helper.
+        # A successful SIGKILL remains pending even if SIGCONT follows it.
+        for process in frozen:
+            try:
+                if process.is_running():
+                    process.resume()
+            except Exception:
+                continue

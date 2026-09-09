@@ -185,6 +185,8 @@ def _failure_streak_nudge(job: dict) -> str:
     streak = int(job.get("failure_streak") or 0) + 1  # +1 = this run
     if streak < threshold:
         return ""
+    if functional_results.result_locale(job) == 'pt-BR':
+        return f"\nRecorrência: {streak} falhas de execução consecutivas. A retomada depende da causa registrada."
     job_ref = job.get("name") or job.get("id") or "this job"
     return (
         f"\nThis job has failed {streak} runs in a row — worth a review. "
@@ -300,6 +302,8 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
     show the operator what broke without dumping provider JSON, retry noise, or
     stack traces into the delivery channel.
     """
+    if functional_results.result_locale(job) == 'pt-BR':
+        return functional_results.unattributed_failure_message(job)
     job_name = job.get("name") or job.get("id") or "cron job"
     text = (error or "unknown error").strip()
     lower = text.lower()
@@ -3271,7 +3275,7 @@ def _deliver_result(
     if wrap_response:
         task_name = job.get("name", job["id"])
         job_id = job.get("id", "")
-        if functional_results.policy_for(job).get('locale') == 'pt-BR':
+        if functional_results.result_locale(job) == 'pt-BR':
             delivery_content = f"{task_name}\n\n{content}\n\nJob: {job_id}"
         else:
             delivery_content = (
@@ -5861,6 +5865,7 @@ def run_job(
             require_parseable_user_config()
         except InvalidUserConfigError as exc:
             logger.error("Job '%s': refusing to run — %s", job_id, exc)
+            functional_results.record_dispatch_refusal('configuration_refused')
             return (False, f"# Cron Job: {job_name}\n\nError: {exc}\n", "", str(exc))
 
     # ---------------------------------------------------------------
@@ -6441,8 +6446,11 @@ def run_job(
                         clear_preflight_alerted(job_id)
                     except Exception:
                         pass
-        except Exception:
+        except Exception as preflight_exc:
             # The validator must never take down a runnable job — fail open.
+            if functional_results.result_locale(job) == 'pt-BR':
+                functional_results.record_dispatch_refusal('configuration_check_failed')
+                return False, '', '', f'configuration_check_failed: {type(preflight_exc).__name__}'
             logger.debug(
                 "Job '%s': preflight validation errored — failing open",
                 job_id, exc_info=True,
@@ -6481,6 +6489,7 @@ def run_job(
                 "state. Set `cron.preflight: false` in config.yaml to "
                 "disable this validation."
             )
+            functional_results.record_dispatch_refusal('configuration_refused', already_alerted=already_alerted)
             return False, blocked_doc, "", f"{marker} {_pf_reason}"
 
         primary_model_for_drift = model
@@ -6671,6 +6680,8 @@ def run_job(
                     DRIFT_SKIP_SILENT_MARKER if _drift_already_alerted
                     else DRIFT_SKIP_MARKER
                 )
+                functional_results.record_dispatch_refusal('inference_configuration_drift',
+                                                          already_alerted=_drift_already_alerted)
                 raise RuntimeError(
                     f"{_drift_marker} Skipped to prevent unintended spend: global "
                     f"inference config drifted since this job was created "
@@ -7786,6 +7797,19 @@ def _run_one_job_body(
             drift_skip = drift_skip_silent or (
                 bool(error) and DRIFT_SKIP_MARKER in str(error)
             )
+            refusal = None
+            if functional_results.result_locale(job) == 'pt-BR':
+                refusal = functional_results.dispatch_refusal(_get_hermes_home(), execution_id, str(job['id']))
+                blocked_config = bool(refusal and refusal['kind'] == 'configuration_refused')
+                blocked_config_silent = bool(blocked_config and refusal['already_alerted'])
+                drift_skip = bool(refusal and refusal['kind'] == 'inference_configuration_drift')
+                drift_skip_silent = bool(drift_skip and refusal['already_alerted'])
+            structured_failure = None
+            if not success:
+                structured_failure = functional_results.scheduler_failure_message(
+                    _get_hermes_home(), execution_id, job,
+                    kind=refusal['kind'] if refusal else 'configuration_refused' if blocked_config else
+                         'inference_configuration_drift' if drift_skip else 'execution_failed')
             if blocked_config and not success:
                 # Blocked-config alert: bypass the generic failure summarizer
                 # (whose auth/timeout heuristics would mislabel this as a
@@ -7794,7 +7818,7 @@ def _run_one_job_body(
                 _pf_text = re.sub(
                     r"\[blocked_config[^\]]*\]\s*", "", str(error)
                 ).strip()
-                deliver_content = (
+                deliver_content = structured_failure if structured_failure is not None else (
                     f"⛔ Cron '{job.get('name') or job['id']}' blocked by "
                     f"configuration validation (no LLM call was made): "
                     f"{_pf_text} "
@@ -7817,9 +7841,7 @@ def _run_one_job_body(
                     if incident_acked and not drift_skip:
                         deliver_content = ""
                     else:
-                        structured_message = functional_results.failure_message(
-                            _get_hermes_home(), execution_id, job)
-                        deliver_content = structured_message if structured_message is not None else (
+                        deliver_content = structured_failure if structured_failure is not None else (
                             _summarize_cron_failure_for_delivery(job, error)
                             + _failure_streak_nudge(job)
                         )
@@ -7836,7 +7858,7 @@ def _run_one_job_body(
                     _drift_text = re.sub(
                         r"\[drift_skip[^\]]*\]\s*", "", str(error)
                     ).strip()
-                    deliver_content = (
+                    deliver_content = structured_failure if structured_failure is not None else (
                         f"⚠️ Cron '{job.get('name') or job['id']}' skipped: "
                         f"{_drift_text}"
                     )
@@ -8043,6 +8065,13 @@ def _run_one_job_body(
             incident_acked, failure_incident_id = _upsert_incident_for_failure(
                 job, _err_text
             )
+            structured_failure = None
+            try:
+                structured_failure = functional_results.scheduler_failure_message(
+                    _get_hermes_home(), execution_id, job, kind='scheduler_exception')
+            except (OSError, ValueError) as observation_exc:
+                logger.error('Scheduler failure observation unavailable for %s: %s',
+                             job['id'], type(observation_exc).__name__)
             if incident_acked:
                 delivery_outcome = "suppressed_acked"
             else:
@@ -8056,8 +8085,9 @@ def _run_one_job_body(
                         # run body every tick builds a streak nobody is ever told
                         # about: its alerts only ever leave through here, and the
                         # nudge only ever left through there (#88655).
-                        _summarize_cron_failure_for_delivery(job, _err_text)
-                        + _failure_streak_nudge(job),
+                        structured_failure if structured_failure is not None else (
+                            _summarize_cron_failure_for_delivery(job, _err_text)
+                            + _failure_streak_nudge(job)),
                         adapters=adapters,
                         loop=loop,
                         for_failure=True,

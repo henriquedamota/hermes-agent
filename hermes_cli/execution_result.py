@@ -10,7 +10,6 @@ import argparse
 from datetime import datetime, timezone
 import json
 import math
-from pathlib import Path
 import sys
 from typing import Any
 
@@ -157,6 +156,12 @@ def build_result(*, subject_type: str, outcome: str = 'unknown', **fields: Any) 
     return validate_result(value)
 
 
+def _has_invalid_observation(metrics: dict) -> bool:
+    return any(key in metrics and (not isinstance(metrics[key], dict)
+               or metrics[key].get('status') == 'invalid')
+               for key in ('runtime_observation', 'scheduler_failure_observation'))
+
+
 def render_result(value: dict, *, locale: str = 'en') -> str:
     r = validate_result(value)
     pt = locale.lower().startswith('pt')
@@ -184,6 +189,10 @@ def render_result(value: dict, *, locale: str = 'en') -> str:
     elif r['outcome'] in ('failed', 'unknown'):
         lines.append(('Motivo: ' if pt else 'Reason: ') + reason['code'])
     metrics = r['metrics']
+    if pt and metrics.get('scheduler_failure') and r['outcome'] in ('completed', 'noop', 'partial', 'deferred'):
+        lines.append('O scheduler registrou falha nesta execução; o resultado funcional acima foi preservado.')
+    if pt and _has_invalid_observation(metrics):
+        lines.append('Uma observação da execução é inválida; o resultado funcional já comprovado foi preservado.')
     if pt and metrics.get('incident_active'):
         cause = metrics.get('cause')
         if cause == 'cycle_slo_exceeded':
@@ -221,6 +230,8 @@ def notification_required(value: dict) -> bool:
     """A causal reminder decision never changes the execution history."""
     result = validate_result(value)
     metrics = result['metrics']
+    if _has_invalid_observation(metrics):
+        return True
     if any(p.get('reason') in ('wall_deadline', 'cancelled')
            for p in metrics.get('runtime', {}).get('processes', [])):
         return True
