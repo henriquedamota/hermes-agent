@@ -63,7 +63,10 @@ it does not prove that SSH or provider credentials are invalid. Deadline
 messages appear in the Desktop log. Probes run in an owned POSIX process group,
 with bounded captured output, and their group is collected on completion,
 timeout or accepted app shutdown. Late output cannot change PATH or start a
-fallback during shutdown. Windows uses its inherited registry environment.
+fallback during shutdown. Accepted shutdown also fences pending backend startup
+before remote resolution, local installation, and process spawn; it does not
+wait for asynchronous teardown to invalidate the connection. Windows uses its
+inherited registry environment.
 
 ## Development
 
