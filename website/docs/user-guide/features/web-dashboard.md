@@ -288,6 +288,14 @@ Usage and cost analytics computed from session history. Select a time period (7,
 
 Create and manage scheduled cron jobs that run agent prompts on a recurring schedule.
 
+For the built-in scheduler, Desktop is a fallback dispatcher. A profile's
+running gateway takes precedence because it owns the live messaging adapters.
+Desktop checks that gateway on each opportunity, including installations with
+only the default profile. If the gateway stops, Desktop can take over without
+a restart; when the gateway returns, Desktop yields again. An unavailable
+profile listing retains this check for the active profile. External scheduler
+providers keep their own dispatch authority.
+
 - **Create** — fill in a name (optional), prompt, cron expression (e.g. `0 9 * * *`), and delivery target (local, Telegram, Discord, Slack, or email)
 - **Job list** — each job shows its name, prompt preview, schedule expression, state badge (enabled/paused/error), delivery target, last run time, and next run time
 - **Pause / Resume** — toggle a job between active and paused states

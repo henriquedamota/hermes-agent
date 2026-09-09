@@ -297,11 +297,21 @@ def _start_desktop_cron_ticker(stop_event: "threading.Event", interval: int = 60
 
     start_kwargs: dict = {"interval": interval}
     if isinstance(provider, InProcessCronScheduler):
+        from hermes_constants import get_hermes_home
+        from hermes_cli.profiles import _check_gateway_running
+
+        # The same authority rule applies with one profile or an unavailable
+        # profile registry. Keep the active home's identity as the fallback;
+        # never fall back to an ungated ticker racing its live gateway.
+        start_kwargs["profile_homes"] = [(None, get_hermes_home())]
+        start_kwargs["profile_gate"] = (
+            lambda _name, home: not _check_gateway_running(Path(home))
+        )
         try:
             from hermes_cli.profiles import profiles_to_serve
 
             profile_homes = list(profiles_to_serve(multiplex=True))
-            if len(profile_homes) > 1:
+            if profile_homes:
                 start_kwargs["profile_homes"] = profile_homes
                 # Stand down, per tick, for any profile whose OWN gateway is
                 # running: that gateway ticks it with live adapters, and the
@@ -309,11 +319,6 @@ def _start_desktop_cron_ticker(stop_event: "threading.Event", interval: int = 60
                 # and deliver the job through the standalone path (#100489).
                 # Evaluated every cycle so a gateway starting/stopping later
                 # is picked up without a dashboard restart.
-                from hermes_cli.profiles import _check_gateway_running
-
-                start_kwargs["profile_gate"] = (
-                    lambda _name, home: not _check_gateway_running(Path(home))
-                )
                 from hermes_logging import enable_profile_log_routing
 
                 enable_profile_log_routing(profile_homes)
@@ -323,9 +328,8 @@ def _start_desktop_cron_ticker(stop_event: "threading.Event", interval: int = 60
                     [name for name, _home in profile_homes],
                 )
         except Exception:
-            # Fail open to the single-store ticker — the active profile's
-            # jobs must keep firing even if profile enumeration breaks.
-            _log.exception("Desktop cron: profile enumeration failed; ticking active profile only")
+            # Retain the gated active-home fallback if enumeration fails.
+            _log.exception("Desktop cron: profile enumeration failed; using gated active profile")
 
     _log.info("Desktop cron scheduler started (provider=%s, interval=%ds)", provider.name, interval)
     provider.start(stop_event, **start_kwargs)
