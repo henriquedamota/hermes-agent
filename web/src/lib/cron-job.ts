@@ -126,8 +126,16 @@ const CRON_LAST_RESULT_TONE: Record<string, CronLastResultTone> = {
 };
 
 export function cronLastResult(
-  job: Pick<CronJob, "last_status" | "last_error" | "last_delivery_error">,
+  job: Pick<CronJob, "last_status" | "last_error" | "last_delivery_error" | "last_result">,
 ): CronLastResult | null {
+  // Current backends own outcome classification; retain the legacy fallback
+  // only for older servers that do not export the shared presentation.
+  if (job.last_result && job.last_result.status === asString(job.last_status).trim().toLowerCase()) {
+    const { status, tone, detail } = job.last_result;
+    if (["success", "warning", "destructive"].includes(tone)) {
+      return { status, tone, detail };
+    }
+  }
   const status = asString(job.last_status).trim();
   if (!status) return null;
   const tone = CRON_LAST_RESULT_TONE[status] ?? "destructive";

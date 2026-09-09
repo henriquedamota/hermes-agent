@@ -2281,6 +2281,8 @@ export interface CronJob {
   last_run_at?: string | null;
   next_run_at?: string | null;
   last_status?: string | null;
+  /** Presentation supplied by the canonical result reader. */
+  last_result?: { status: string; tone: "success" | "warning" | "destructive"; detail: string | null } | null;
   last_error?: string | null;
   last_delivery_error?: string | null;
   last_fire_error?: { at?: string | null; detail?: string | null } | null;

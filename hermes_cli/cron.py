@@ -267,16 +267,12 @@ def cron_list(show_all: bool = False, *, json_output: bool = False):
         last_status = job.get("last_status")
         if last_status:
             last_run = job.get("last_run_at", "?")
-            if last_status == "ok":
-                status_display = color("ok", Colors.GREEN)
-            elif last_status == "delivery_failed":
-                # The agent succeeded but the result never reached the user —
-                # not green, and the detail lives in last_delivery_error
-                # (last_error is None for these runs).
-                detail = job.get("last_delivery_error") or "?"
-                status_display = color(f"delivery_failed: {detail}", Colors.YELLOW)
-            else:
-                status_display = color(f"{last_status}: {job.get('last_error', '?')}", Colors.RED)
+            from cron.result_export import last_result
+            summary = last_result(job)
+            detail = f": {summary['detail']}" if summary['detail'] else ""
+            tone = {'success': Colors.GREEN, 'warning': Colors.YELLOW, 'destructive': Colors.RED}
+            status_display = color(f"{summary['status']}{detail}", tone[summary['tone']])
+            if summary['failed']:
                 streak = int(job.get("failure_streak") or 0)
                 if streak >= 2:
                     status_display += color(f"  ({streak} failures in a row)", Colors.RED)
@@ -717,13 +713,16 @@ def _next_run_overdue_issue(next_run: str) -> Optional[str]:
 def _cron_doctor_issues_for_job(job: Dict[str, Any]) -> List[str]:
     issues: List[str] = []
 
-    last_status = str(job.get("last_status") or "").strip().lower()
-    # "delivery_failed" means the agent run itself succeeded, so it is not a
-    # failed last run — the dedicated delivery issue below reports it (and
-    # last_error is None, which would render as "unknown error" here).
-    if last_status and last_status not in {"ok", "delivery_failed"}:
-        err = str(job.get("last_error") or "unknown error").strip()
-        issues.append(f"last run failed: {err}")
+    from cron.result_export import last_result
+    summary = last_result(job)
+    if summary and summary['failed']:
+        issues.append(f"last run failed: {job.get('last_error') or 'unknown error'}")
+    elif summary and summary['unknown']:
+        issues.append(f"last functional result unknown: {summary['status']}")
+    if summary and summary['unresolved_failure']:
+        failure = job['last_failure'] if isinstance(job['last_failure'], dict) else {}
+        issues.append(f"unresolved earlier failure: {failure.get('detail') or 'unknown detail'} "
+                      f"(execution {failure.get('execution_id') or 'unknown'})")
 
     delivery_err = str(job.get("last_delivery_error") or "").strip()
     if delivery_err:
@@ -973,8 +972,14 @@ def _job_action(action: str, job_id: str, success_verb: str) -> int:
             else:
                 print("  Running in background.")
         elif job.get("executed"):
-            outcome = "succeeded" if job.get("execution_success") else "failed"
-            print(f"  Ran now: {outcome}.")
+            receipt = job.get('functional_result')
+            if receipt is not None:
+                from hermes_cli.execution_result import render_result
+                locale = (job.get('execution_policy') or {}).get('locale', 'en')
+                print(render_result(receipt, locale=locale))
+            else:
+                outcome = "succeeded" if job.get("execution_success") else "failed"
+                print(f"  Ran now: {outcome}.")
         elif job.get("execution_skipped"):
             print(f"  {job['execution_skipped']}")
         else:

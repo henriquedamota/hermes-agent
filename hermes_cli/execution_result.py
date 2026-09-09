@@ -15,6 +15,9 @@ from typing import Any
 
 CONTRACT = 'hermes.execution-result/v1'
 OUTCOMES = ('completed', 'noop', 'skipped', 'deferred', 'partial', 'failed', 'unknown')
+COMPLETED_OUTCOMES = ('completed', 'noop')
+WAITING_OUTCOMES = ('skipped', 'deferred', 'partial')
+FAILED_OUTCOMES = ('failed', 'unknown')
 SUBJECTS = ('job', 'stage', 'cycle', 'worker', 'probe', 'maintenance')
 IDENTITIES = ('job_id', 'execution_id', 'run_id', 'cycle_id', 'code_revision', 'input_revision', 'output_revision')
 TIMES = ('started_at', 'finished_at', 'observed_at')

@@ -2624,8 +2624,10 @@ def list_jobs(include_disabled: bool = False) -> List[Dict[str, Any]]:
         latest = latest_executions([job.get("id", "") for job in jobs])
     except Exception:
         latest = {}
+    from cron.result_export import last_result
     for job in jobs:
         job["latest_execution"] = latest.get(job.get("id", ""))
+        job["last_result"] = last_result(job)
     return jobs
 
 
@@ -3150,9 +3152,10 @@ def _mark_job_run_locked(
         if functional_result['job_id'] != job_id:
             raise ValueError('functional result belongs to another job')
         outcome = functional_result['outcome']
-    waiting = outcome in ('deferred', 'partial', 'skipped')
-    healed = outcome in ('completed', 'noop') if outcome is not None else success
-    failed = outcome in ('failed', 'unknown') if outcome is not None else not success
+    from hermes_cli.execution_result import COMPLETED_OUTCOMES, WAITING_OUTCOMES, FAILED_OUTCOMES
+    waiting = outcome in WAITING_OUTCOMES
+    healed = outcome in COMPLETED_OUTCOMES if outcome is not None else success
+    failed = outcome in FAILED_OUTCOMES if outcome is not None else not success
     with _jobs_lock():
         jobs = load_jobs()
         for i, job in enumerate(jobs):

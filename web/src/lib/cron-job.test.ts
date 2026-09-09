@@ -156,6 +156,27 @@ describe("cronJobFormFromJob", () => {
 });
 
 describe("cronLastResult", () => {
+  it.each([
+    ["completed", "success"], ["noop", "success"], ["deferred", "warning"],
+    ["partial", "warning"], ["skipped", "warning"], ["failed", "destructive"],
+    ["unknown", "destructive"],
+  ] as const)("uses the backend presentation for %s", (status, tone) => {
+    expect(cronLastResult({last_status: status, last_result: {status, tone, detail: null}}))
+      .toEqual({status, tone, detail: null});
+  });
+
+  it("preserves completed work while showing a delivery failure", () => {
+    expect(cronLastResult({last_status: "completed", last_result: {
+      status: "completed", tone: "warning", detail: "Message delivery failed",
+    }})).toEqual({status: "completed", tone: "warning", detail: "Message delivery failed"});
+  });
+
+  it("does not use a stale presentation from another status", () => {
+    expect(cronLastResult({last_status: "error", last_error: "failed now", last_result: {
+      status: "completed", tone: "success", detail: null,
+    }})).toEqual({status: "error", tone: "destructive", detail: "failed now"});
+  });
+
   it("renders nothing for a job that never ran", () => {
     expect(cronLastResult({ last_status: null })).toBeNull();
     expect(cronLastResult({ last_status: "" })).toBeNull();

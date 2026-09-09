@@ -750,6 +750,7 @@ def _validate_cron_script_path(script: Optional[str]) -> Optional[str]:
 
 
 def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
+    from cron.result_export import last_result
     prompt = str(job.get("prompt") or "")
     skills = _canonical_skills(job.get("skill"), job.get("skills"))
     job_id = str(job.get("id") or "unknown")
@@ -769,6 +770,7 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         "next_run_at": job.get("next_run_at"),
         "last_run_at": job.get("last_run_at"),
         "last_status": job.get("last_status"),
+        "last_result": last_result(job),
         "last_delivery_error": job.get("last_delivery_error"),
         "last_delivery_unverified": job.get("last_delivery_unverified"),
         "last_fire_error": job.get("last_fire_error"),
@@ -1133,28 +1135,40 @@ def _run_claimed_job(
             from cron.executions import get_execution
 
             execution = get_execution(str(execution_id))
-        last_status = refreshed.get("last_status")
-        # "delivery_failed" (#83993): the agent run itself succeeded but the
-        # output never reached the user. That is NOT a success for the caller
-        # — the calling agent relays this result — so report it as failed
-        # and surface the delivery error, which lives in last_delivery_error
-        # (last_error is None for these runs, and a bare success=False with
-        # error=None reads as an unexplained failure).
-        ok = last_status == "ok"
-        run_error = refreshed.get("last_error")
-        if last_status == "delivery_failed" and not run_error:
-            run_error = refreshed.get("last_delivery_error")
-        if execution is not None and execution.get("status") != "completed":
+        from hermes_cli.execution_result import COMPLETED_OUTCOMES, FAILED_OUTCOMES, build_result
+        from cron.result_export import execution as export_execution
+        required = (job.get('execution_policy') or {}).get('functional_result') == 'required'
+        receipt = None
+        if execution is not None and (execution.get('functional_result_json') or required):
+            receipt = export_execution(execution)['functional_result']
+            if execution.get('job_id') != job_id:
+                receipt = build_result(subject_type='job', job_id=job_id,
+                    execution_id=str(execution_id),
+                    reason={'code':'manual_execution_job_mismatch'})
+        elif required:
+            receipt = build_result(subject_type='job', job_id=job_id,
+                execution_id=str(execution_id) if execution_id else None,
+                reason={'code':'manual_execution_receipt_unavailable'})
+        if receipt is not None:
+            ok = receipt['outcome'] in COMPLETED_OUTCOMES
+            run_error = (receipt['reason'].get('detail') or receipt['reason']['code']) if receipt['outcome'] in FAILED_OUTCOMES else None
+            delivery_failed = receipt['delivery']['status'] == 'failed'
+        else:
+            # Legacy optional producers have no functional proof. Preserve their
+            # process verdict without manufacturing a completed receipt.
+            ok = refreshed.get('last_status') == 'ok'
+            delivery_failed = refreshed.get('last_status') == 'delivery_failed'
+            run_error = refreshed.get('last_error')
+        if delivery_failed:
             ok = False
-            run_error = (
-                execution.get("error")
-                or f"execution ended in {execution.get('status') or 'unknown'} state"
-            )
-        return {
-            "claimed": True,
-            "success": bool(processed and ok),
-            "error": run_error,
-        }
+            run_error = run_error or refreshed.get('last_delivery_error') or 'message delivery failed'
+        if execution is not None and execution.get('status') != 'completed':
+            ok = False
+            run_error = execution.get('error') or f"execution ended in {execution.get('status') or 'unknown'} state"
+        return {'claimed': True, 'success': bool(processed and ok), 'error': run_error,
+                'functional_result': receipt,
+                'process_status': execution.get('status') if execution is not None else None,
+                'delivery_outcome': execution.get('delivery_outcome') if execution is not None else None}
 
     except Exception as e:
         logger.error("Failed to execute cron job %s immediately: %s", job_id, e)
@@ -1396,21 +1410,29 @@ def _try_dispatch_background_run(
         res = _run_claimed_job(claimed_job, extra_prompt=extra_prompt)
         duration = round(time.time() - started_at, 2)
         refreshed = get_job(job_id) or {}
-        lines = [
-            f"Cron job '{job_name}' ({job_id}) finished its manual run.",
-            f"Result: {'ok' if res.get('success') else 'FAILED'}"
-            + (f" — {res.get('error')}" if res.get("error") else ""),
-            f"Delivery target: {deliver}"
-            + _manual_run_delivery_note(deliver, refreshed),
-        ]
+        receipt = res.get('functional_result')
+        if receipt is not None:
+            from hermes_cli.execution_result import render_result
+            locale = (claimed_job.get('execution_policy') or {}).get('locale', 'en')
+            lines = [render_result(receipt, locale=locale)]
+        else:
+            lines = [
+                f"Cron job '{job_name}' ({job_id}) finished its manual run.",
+                f"Result: {'ok' if res.get('success') else 'FAILED'}"
+                + (f" — {res.get('error')}" if res.get("error") else ""),
+                f"Delivery target: {deliver}" + _manual_run_delivery_note(deliver, refreshed),
+            ]
         if refreshed.get("next_run_at"):
-            lines.append(f"Next scheduled run: {refreshed['next_run_at']}")
-        excerpt = _latest_job_output_excerpt(job_id)
+            label = 'Próxima oportunidade' if receipt is not None and locale == 'pt-BR' else 'Next scheduled run'
+            lines.append(f"{label}: {refreshed['next_run_at']}")
+        excerpt = _latest_job_output_excerpt(job_id) if receipt is None else None
         if excerpt:
             lines.append("--- JOB OUTPUT ---")
             lines.append(excerpt)
         return {
-            "status": "completed" if res.get("success") else "error",
+            # Delegation completion is separate from the functional outcome.
+            "status": "completed" if res.get("success") or (receipt is not None and receipt['outcome'] in ('deferred', 'partial', 'skipped') and not res.get('error')) else "error",
+            "functional_result": receipt,
             "summary": "\n".join(lines),
             "error": res.get("error"),
             "api_calls": 0,
@@ -1836,6 +1858,9 @@ def cronjob(
             result = _format_job(get_job(job_id) or {"id": job_id})
             result["executed"] = exec_result.get("claimed", False)
             result["execution_success"] = exec_result.get("success", False)
+            for field in ('functional_result', 'process_status', 'delivery_outcome'):
+                if field in exec_result:
+                    result[field] = exec_result[field]
             if not exec_result.get("claimed", False):
                 result["execution_skipped"] = exec_result.get("error") or (
                     "Already being fired by the scheduler; not run again."

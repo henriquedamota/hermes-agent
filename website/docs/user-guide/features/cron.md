@@ -392,7 +392,8 @@ hermes cron doctor
 
 Checks per active job:
 
-- last run failed (`last_status` not ok, with the recorded error),
+- last run failed or its functional outcome is unknown, with the recorded detail,
+- an earlier failure remains unresolved while the latest attempt is deferred, partial, or skipped,
 - last delivery failed (the output was produced but never reached you),
 - `next_run_at` missing, or parked in the past beyond a 15-minute ticker
   grace window — the "job is silently not firing" signal (scheduler dead,
@@ -400,6 +401,16 @@ Checks per active job:
 - script missing, not a file, or resolving outside `HERMES_HOME/scripts`,
 - `no_agent` job with no script,
 - configured `workdir` that no longer exists.
+
+Structured producers use `hermes.execution-result/v1`: `completed` and measured
+`noop` are functional results; `deferred`, `partial`, and `skipped` are expected
+waits, not failed attempts. A wait does not erase an earlier unresolved failure.
+The CLI, tool responses and dashboard share the stored summary presentation;
+only the execution receipt attests functional completion. Manual runs export
+that receipt separately from process and delivery status, and render the same
+message as scheduled runs. A delivery failure preserves completed work and does
+not authorize repeating its effects. Legacy optional producers retain their
+process status without gaining a fabricated functional receipt.
 
 Doctor never mutates jobs or state — it only reports. Pair it with
 `hermes cron incidents` (durable failure records) and `hermes cron runs`
