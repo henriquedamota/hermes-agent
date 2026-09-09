@@ -13320,19 +13320,13 @@ def _get_cron_job_sync(job_id: str, profile: Optional[str] = None):
 
 
 def _list_cron_job_runs_sync(job_id: str, profile: Optional[str] = None, limit: int = 20):
-    """Run sessions produced by a cron job, newest first.
+    """Native execution history plus the job's independently stored conversations.
 
-    Cron runs are stored as ordinary sessions whose id is
-    ``cron_{job_id}_{timestamp}`` (see cron/scheduler.run_job). A job's history
-    is therefore every session whose id carries that prefix; ``source='cron'``
-    narrows it and the id prefix binds it to this job. Powers the run-history
-    list under each job in the desktop cron detail. Same row shape as
-    ``/api/sessions`` so the frontend can reuse SessionInfo.
-
-    Backed by ``SessionDB.list_cron_job_runs`` — a bounded ``[prefix, hi)``
-    id-range scan, not the compression-chain CTE used for the recents list,
-    so the cost scales with the requested window and not the (unbounded) total
-    cron history.
+    Script-only jobs have execution receipts but no conversation. Keep ``runs``
+    compatible with older clients, and add the same versioned projection used by
+    ``hermes cron runs --json``. Never fabricate a session or infer a functional
+    result from a conversation/process status. Both reads are bounded and scoped
+    to the selected profile; native executions use durable sequence order.
     """
     selected = profile or _find_cron_job_profile(job_id)
     # job_id may be a human name; resolve to the canonical id used in run-session ids.
@@ -13347,7 +13341,18 @@ def _list_cron_job_runs_sync(job_id: str, profile: Optional[str] = None, limit: 
     except (TypeError, ValueError):
         limit_n = 20
 
-    db = _open_session_db_for_profile(selected, read_only=True)
+    from cron.executions import list_executions
+    from cron.result_export import execution
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    profile_name, home = _cron_profile_home(selected)
+    token = set_hermes_home_override(home)
+    try:
+        records = [execution(row) for row in list_executions(job_id=canonical, limit=limit_n)]
+    finally:
+        reset_hermes_home_override(token)
+
+    db = _open_session_db_for_profile(profile_name, read_only=True)
     try:
         runs = db.list_cron_job_runs(canonical, limit=limit_n, offset=0)
         now = time.time()
@@ -13359,7 +13364,9 @@ def _list_cron_job_runs_sync(job_id: str, profile: Optional[str] = None, limit: 
             s["archived"] = bool(s.get("archived"))
             if selected:
                 s["profile"] = selected
-        return {"runs": runs, "limit": limit_n}
+        return {"runs": runs, "limit": limit_n, "execution_history": {
+            "contract": "hermes.execution-history/v1", "records": records, "profile": profile_name,
+        }}
     finally:
         db.close()
 
