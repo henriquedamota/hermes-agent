@@ -12,6 +12,7 @@ import os
 import subprocess
 import sys
 import threading
+from io import BytesIO
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -946,6 +947,7 @@ class TestPythonpathSelectiveStrip:
         assert "/home/user/my-lib" in entries
 
     @pytest.mark.parametrize("same_env", [True, False])
+    @pytest.mark.filterwarnings("error::pytest.PytestUnhandledThreadExceptionWarning")
     def test_execute_code_composition_strips_inherited_hermes_entries(self, same_env):
         """Integration: execute_code's real spawn path composes a clean PYTHONPATH.
 
@@ -977,8 +979,10 @@ class TestPythonpathSelectiveStrip:
             captured["env"] = kwargs.get("env", {})
             captured["staging"] = os.path.dirname(cmd[1])
             proc = MagicMock()
-            proc.stdout.read.return_value = b""
-            proc.stderr.read.return_value = b""
+            # Both one-shot and persistent kernel readers must see real EOF,
+            # including read1(), without creating unbounded MagicMock chunks.
+            proc.stdout = BytesIO()
+            proc.stderr = BytesIO()
             proc.wait.return_value = 0
             proc.returncode = 0
             proc.poll.return_value = 0
