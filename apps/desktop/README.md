@@ -54,6 +54,17 @@ The installer handles everything for you (Python 3.11+, a portable Git, ripgrep)
 
 ---
 
+## Startup shell environment
+
+On macOS and Linux, GUI startup resolves the login-shell PATH before starting
+local or remote backends. Each of the interactive-login and login fallback
+probes has a five-second wall deadline. Failure retains the inherited PATH;
+it does not prove that SSH or provider credentials are invalid. Deadline
+messages appear in the Desktop log. Probes run in an owned POSIX process group,
+with bounded captured output, and their group is collected on completion,
+timeout or accepted app shutdown. Late output cannot change PATH or start a
+fallback during shutdown. Windows uses its inherited registry environment.
+
 ## Development
 
 Want to hack on the app itself? Install workspace deps from the repo root once, then run the dev server from this directory:
