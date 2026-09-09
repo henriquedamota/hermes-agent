@@ -99,7 +99,7 @@ def test_display_never_invents_none_as_error(isolated, capsys):
     assert 'completed: None' not in capsys.readouterr().out
 
 
-def test_completed_work_and_delivery_failure_remain_separate(isolated):
+def test_completed_work_and_delivery_failure_remain_separate(isolated, capsys):
     job = producer(isolated, 'completed')
     with patch('cron.scheduler._deliver_result', return_value='isolated delivery failure') as delivery:
         payload = json.loads(cronjob(action='run', job_id=job['id']))['job']
@@ -114,6 +114,12 @@ def test_completed_work_and_delivery_failure_remain_separate(isolated):
     assert summary['tone'] == 'warning'
     assert not summary['failed']
     assert 'isolated delivery failure' in payload['execution_error']
+    from hermes_cli.cli_commands_mixin import CLICommandsMixin
+    class Host(CLICommandsMixin):
+        pass
+    Host()._handle_cron_command('/cron list --all')
+    assert 'completed: isolated delivery failure' in capsys.readouterr().out
+
 
 
 def test_unknown_summary_is_not_invented_as_a_process_failure():
