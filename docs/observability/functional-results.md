@@ -68,6 +68,16 @@ completed/noop/failed receipt or a delivery failure never requests generic repla
 Expected waits preserve the failure streak and do not consume the completion
 counter. Only verified completed/noop heals a migrated job's streak.
 
+The due scanner treats this opportunity as an absolute instant, including after
+restart or a missed tick. Cron-expression repair, timezone migration and the
+original one-shot grace window must not discard a functional continuation.
+The latest native execution must still be the waiting receipt that requested
+it; a newer claimed, running, failed or unknown attempt consumes the old request.
+Advancing `next_run_at` before creating an execution does not consume it. This
+repairs legacy stores whose next opportunity was incorrectly moved to the next
+regular cron occurrence, without editing their historical receipts. Pause,
+execution claims, producer admission and failure history remain authoritative.
+
 `execution_policy.wall_timeout_seconds` sets a monotonic per-execution wall
 budget across script and agent. Heartbeat activity cannot reset it. Inactivity
 limits, agent/tool deadlines, memory protection, process-tree cancellation and
