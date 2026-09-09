@@ -92,6 +92,19 @@ def test_late_oneshot_continuation_keeps_dispatch_budget(job, monkeypatch):
     assert jobs.get_job(task['id'])['repeat']['completed'] == 1
 
 
+def test_resume_preserves_verified_oneshot_continuation_after_original_time(job, monkeypatch):
+    now = datetime(2026, 9, 9, 5, 20, 20, tzinfo=timezone.utc)
+    monkeypatch.setattr(jobs, '_hermes_now', lambda: now)
+    task = jobs.create_job('isolated resumable one-shot', (now+timedelta(minutes=1)).isoformat(), deliver='local')
+    jobs.claim_dispatch(task['id'])
+    result = persist_wait(task, now, monkeypatch)
+    jobs.pause_job(task['id'], 'isolated maintenance')
+    monkeypatch.setattr(jobs, '_hermes_now', lambda: now+timedelta(hours=3))
+    resumed = jobs.resume_job(task['id'])
+    assert resumed['next_run_at'] == result['continuation']['eligible_at']
+    assert [row['id'] for row in jobs.get_due_jobs()] == [task['id']]
+
+
 @pytest.mark.parametrize('invalid', ['invalid', '2026-09-09T05:25:20', '2026-09-09T05:21:20+00:00'])
 def test_invalid_pending_timestamp_cannot_override_regular_schedule(job, monkeypatch, invalid):
     now = datetime(2026, 9, 9, 5, 20, 20, tzinfo=timezone.utc)

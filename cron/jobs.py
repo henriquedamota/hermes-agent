@@ -2844,6 +2844,11 @@ def resume_job(job_id: str) -> Optional[Dict[str, Any]]:
         return None
 
     next_run_at = compute_next_run(job["schedule"])
+    continuation_at = _pending_continuation_at(job)
+    if continuation_at is not None and (
+        next_run_at is None or continuation_at < _ensure_aware(datetime.fromisoformat(next_run_at))
+    ):
+        next_run_at = continuation_at.isoformat()
     if next_run_at is None and job["schedule"].get("kind") == "once":
         run_at = job["schedule"].get("run_at", "unknown")
         raise ValueError(
