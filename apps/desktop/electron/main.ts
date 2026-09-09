@@ -356,7 +356,7 @@ import {
   SESSION_WINDOW_MIN_HEIGHT,
   SESSION_WINDOW_MIN_WIDTH
 } from './session-windows'
-import { ensureLoginShellPath } from './shell-path'
+import { cancelLoginShellPath, ensureLoginShellPath } from './shell-path'
 import { createBootstrapCoordinator, sshConfigFingerprint } from './ssh-bootstrap-coordinator'
 import { collectSshConfigHosts, parseSshGOutput } from './ssh-config'
 import { createSshProbeConnection, pickLocalPort, redactSecrets, SshConnection } from './ssh-connection'
@@ -18051,6 +18051,7 @@ app.on('before-quit', event => {
   // Seal the SSH coordinator before touching connections so reconnect
   // callbacks cannot recreate a backend for a registration whose app is
   // already quitting (#91668).
+  cancelLoginShellPath()
   sshBootstrapCoordinator.shutdown()
 
   if (!backendQuitTeardownDone) {

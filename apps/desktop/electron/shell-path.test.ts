@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict'
+import { EventEmitter } from 'node:events'
+import { PassThrough } from 'node:stream'
 
 import { beforeEach, test } from 'vitest'
 
@@ -14,14 +16,23 @@ import {
 const START = '__HERMES_LOGIN_PATH_START__'
 const END = '__HERMES_LOGIN_PATH_END__'
 
-function fakeExecFile(outputsByFlags, { error = null, calls = [] }: any = {}) {
-  return (file, args, _options, callback) => {
+function fakeSpawn(outputsByFlags, { error = null, calls = [] }: any = {}) {
+  return (file, args) => {
     calls.push({ file, args })
-    const flags = args[0]
-    const stdout = outputsByFlags[flags] ?? ''
-    queueMicrotask(() => callback(error, stdout, ''))
 
-    return { stdin: { end() {} } }
+    const child = Object.assign(new EventEmitter(), {
+      stdin: new PassThrough(),
+      stdout: new PassThrough(),
+      stderr: new PassThrough()
+    })
+
+    queueMicrotask(() => {
+      child.stdout.write(outputsByFlags[args[0]] ?? '')
+      // Nonzero shell exit may still carry a valid sentinel.
+      child.emit('close', error ? 1 : 0)
+    })
+
+    return child
   }
 }
 
@@ -64,9 +75,9 @@ test('loginShellExecutable honors $SHELL and falls back per platform', () => {
 test('applyLoginShellPath merges the captured login PATH into the env', async () => {
   const env: any = { SHELL: '/bin/zsh', PATH: '/usr/bin:/bin' }
   const calls: any[] = []
-  const execFileFn = fakeExecFile({ '-ilc': `${START}/opt/homebrew/bin:/Users/u/.cargo/bin:/usr/bin${END}` }, { calls })
+  const spawnFn = fakeSpawn({ '-ilc': `${START}/opt/homebrew/bin:/Users/u/.cargo/bin:/usr/bin${END}` }, { calls })
 
-  const result = await applyLoginShellPath({ env, platform: 'darwin', execFileFn })
+  const result = await applyLoginShellPath({ env, platform: 'darwin', spawnFn })
 
   assert.equal(result.applied, true)
   assert.equal(env.PATH, '/opt/homebrew/bin:/Users/u/.cargo/bin:/usr/bin:/bin')
@@ -78,9 +89,9 @@ test('applyLoginShellPath merges the captured login PATH into the env', async ()
 test('applyLoginShellPath falls back to -lc when -ilc yields no sentinel (bash 3.2 swallow)', async () => {
   const env: any = { SHELL: '/bin/bash', PATH: '/usr/bin' }
   const calls: any[] = []
-  const execFileFn = fakeExecFile({ '-ilc': 'swallowed', '-lc': `${START}/opt/homebrew/bin:/usr/bin${END}` }, { calls })
+  const spawnFn = fakeSpawn({ '-ilc': 'swallowed', '-lc': `${START}/opt/homebrew/bin:/usr/bin${END}` }, { calls })
 
-  const result = await applyLoginShellPath({ env, platform: 'darwin', execFileFn })
+  const result = await applyLoginShellPath({ env, platform: 'darwin', spawnFn })
 
   assert.equal(result.applied, true)
   assert.deepEqual(
@@ -92,9 +103,9 @@ test('applyLoginShellPath falls back to -lc when -ilc yields no sentinel (bash 3
 
 test('applyLoginShellPath leaves the env untouched when resolution fails', async () => {
   const env: any = { SHELL: '/bin/zsh', PATH: '/usr/bin:/bin' }
-  const execFileFn = fakeExecFile({}, { error: new Error('boom') })
+  const spawnFn = fakeSpawn({}, { error: new Error('boom') })
 
-  const result = await applyLoginShellPath({ env, platform: 'darwin', execFileFn })
+  const result = await applyLoginShellPath({ env, platform: 'darwin', spawnFn })
 
   assert.equal(result.applied, false)
   assert.equal(result.reason, 'unresolved')
@@ -103,9 +114,9 @@ test('applyLoginShellPath leaves the env untouched when resolution fails', async
 
 test('applyLoginShellPath reports unchanged when the login PATH adds nothing new', async () => {
   const env: any = { SHELL: '/bin/zsh', PATH: '/opt/homebrew/bin:/usr/bin' }
-  const execFileFn = fakeExecFile({ '-ilc': `${START}/opt/homebrew/bin:/usr/bin${END}` })
+  const spawnFn = fakeSpawn({ '-ilc': `${START}/opt/homebrew/bin:/usr/bin${END}` })
 
-  const result = await applyLoginShellPath({ env, platform: 'darwin', execFileFn })
+  const result = await applyLoginShellPath({ env, platform: 'darwin', spawnFn })
 
   assert.equal(result.applied, false)
   assert.equal(result.reason, 'unchanged')
@@ -124,11 +135,11 @@ test('applyLoginShellPath is a no-op on Windows', async () => {
 test('ensureLoginShellPath is single-flight — concurrent callers share one shell probe', async () => {
   const env: any = { SHELL: '/bin/zsh', PATH: '/usr/bin' }
   const calls: any[] = []
-  const execFileFn = fakeExecFile({ '-ilc': `${START}/opt/homebrew/bin:/usr/bin${END}` }, { calls })
+  const spawnFn = fakeSpawn({ '-ilc': `${START}/opt/homebrew/bin:/usr/bin${END}` }, { calls })
 
   const [first, second] = await Promise.all([
-    ensureLoginShellPath({ env, platform: 'darwin', execFileFn }),
-    ensureLoginShellPath({ env, platform: 'darwin', execFileFn })
+    ensureLoginShellPath({ env, platform: 'darwin', spawnFn }),
+    ensureLoginShellPath({ env, platform: 'darwin', spawnFn })
   ])
 
   assert.equal(first.applied, true)
@@ -138,10 +149,10 @@ test('ensureLoginShellPath is single-flight — concurrent callers share one she
 })
 
 test('ensureLoginShellPath never rejects', async () => {
-  const execFileFn = () => {
+  const spawnFn = () => {
     throw new Error('spawn EACCES')
   }
 
-  const result = await ensureLoginShellPath({ env: { SHELL: '/bin/zsh' }, platform: 'darwin', execFileFn })
+  const result = await ensureLoginShellPath({ env: { SHELL: '/bin/zsh' }, platform: 'darwin', spawnFn })
   assert.equal(result.applied, false)
 })
