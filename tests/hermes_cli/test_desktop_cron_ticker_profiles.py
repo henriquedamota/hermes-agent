@@ -8,7 +8,6 @@ every profile's store — the desktop sibling of the multiplex-gateway fix for
 #69377.
 """
 
-from pathlib import Path
 import threading
 
 import pytest
@@ -70,34 +69,59 @@ def test_multi_profile_homes_passed_to_builtin(monkeypatch, _providers, tmp_path
     assert builtin.start_kwargs["profile_homes"] == homes
 
 
-def test_single_profile_keeps_legacy_path(monkeypatch, _providers, tmp_path):
+@pytest.mark.parametrize("gateway_running", [True, False])
+def test_single_profile_keeps_gateway_authority(monkeypatch, _providers, tmp_path, gateway_running):
     _sp, builtin = _providers
     import hermes_cli.profiles as profiles_mod
 
+    home = tmp_path / "root"
+    checked_homes = []
+
+    def gateway_probe(observed_home):
+        checked_homes.append(observed_home)
+        return gateway_running
+
+    monkeypatch.setattr(profiles_mod, "_check_gateway_running", gateway_probe)
     monkeypatch.setattr(
         profiles_mod,
         "profiles_to_serve",
-        lambda **_kw: [("default", tmp_path / "root")],
+        lambda **_kw: [("default", home)],
     )
 
     ws._start_desktop_cron_ticker(threading.Event(), interval=9)
 
-    assert builtin.start_kwargs == {"interval": 9}
+    assert builtin.start_kwargs["interval"] == 9
+    assert builtin.start_kwargs["profile_homes"] == [("default", home)]
+    assert builtin.start_kwargs["profile_gate"]("default", home) is not gateway_running
+    assert checked_homes == [home]
 
 
-def test_enumeration_failure_fails_open(monkeypatch, _providers):
-    """The active profile's jobs keep firing even if profile listing breaks."""
+@pytest.mark.parametrize("gateway_running", [True, False])
+def test_enumeration_failure_retains_gated_active_home(monkeypatch, _providers, tmp_path, gateway_running):
+    """A listing failure must not compete with the active home's gateway."""
     _sp, builtin = _providers
     import hermes_cli.profiles as profiles_mod
+
+    home = tmp_path / "active"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    checked_homes = []
+
+    def gateway_probe(observed_home):
+        checked_homes.append(observed_home)
+        return gateway_running
 
     def _boom(**_kw):
         raise RuntimeError("profiles dir unreadable")
 
+    monkeypatch.setattr(profiles_mod, "_check_gateway_running", gateway_probe)
     monkeypatch.setattr(profiles_mod, "profiles_to_serve", _boom)
 
     ws._start_desktop_cron_ticker(threading.Event(), interval=11)
 
-    assert builtin.start_kwargs == {"interval": 11}
+    assert builtin.start_kwargs["interval"] == 11
+    assert builtin.start_kwargs["profile_homes"] == [(None, home)]
+    assert builtin.start_kwargs["profile_gate"](None, home) is not gateway_running
+    assert checked_homes == [home]
 
 
 def test_external_provider_never_gets_profile_homes(monkeypatch, tmp_path):
