@@ -4,6 +4,7 @@ import {
   createCronJob,
   deleteCronJob,
   getCronJob,
+  getCronJobHistory,
   getCronJobRuns,
   getCronJobs,
   pauseCronJob,
@@ -47,6 +48,7 @@ describe('cron helpers are profile-scoped', () => {
     void getCronJobs()
     void getCronJob('job-1')
     void getCronJobRuns('job-1')
+    void getCronJobHistory('job-1')
     void createCronJob({ name: 'nightly', prompt: 'run', schedule: '0 3 * * *' } as never)
     void updateCronJob('job-1', { enabled: false } as never)
     void pauseCronJob('job-1')
@@ -103,5 +105,37 @@ describe('cron helpers are profile-scoped', () => {
     // Omitting the arg keeps the legacy unfiltered path.
     void getCronJobs()
     expect(api.mock.calls.at(-1)?.[0].path).toBe('/api/cron/jobs')
+  })
+
+  it('carries the job owner profile as well as the active remote connection', async () => {
+    setApiRequestConnection('atlas-remote')
+    setApiRequestProfile('default')
+    await getCronJobHistory('job / 1', 5, 'worker')
+    expect(api.mock.calls.at(-1)?.[0]).toMatchObject({
+      connectionId: 'atlas-remote',
+      profile: 'default',
+      path: '/api/cron/jobs/job%20%2F%201/runs?limit=5&profile=worker'
+    })
+  })
+
+  it('keeps native receipts and conversations separate', async () => {
+    const history = {
+      runs: [{ id: 'real-session' }],
+      execution_history: {
+        contract: 'hermes.execution-history/v1',
+        profile: 'worker',
+        records: [{ id: 'native-execution' }]
+      }
+    }
+
+    api.mockResolvedValueOnce(history as never)
+    expect(await getCronJobHistory('job')).toEqual(history)
+  })
+
+  it('does not turn unknown or malformed native contracts into legacy empty history', async () => {
+    api.mockResolvedValueOnce({ runs: [], execution_history: { contract: 'unknown/v2', records: [] } } as never)
+    await expect(getCronJobHistory('job')).rejects.toThrow('Unsupported cron execution history')
+    api.mockResolvedValueOnce({ runs: [], execution_history: null } as never)
+    await expect(getCronJobHistory('job')).rejects.toThrow('Unsupported cron execution history')
   })
 })

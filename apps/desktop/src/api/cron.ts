@@ -39,14 +39,53 @@ export function getCronJob(jobId: string): Promise<CronJob> {
   })
 }
 
-export async function getCronJobRuns(jobId: string, limit = 20): Promise<SessionInfo[]> {
-  const { runs } = await hermesApi<{ runs: SessionInfo[] }>({
+export interface CronExecutionRecord {
+  id: string
+  sequence: number | null
+  job_id: string
+  status: string
+  started_at: string | null
+  claimed_at: string | null
+  finished_at: string | null
+  delivery_outcome: string | null
+  message: string
+  functional_result: { outcome: string; exit_code: number | null }
+}
+
+export interface CronJobHistory {
+  runs: SessionInfo[]
+  execution_history?: {
+    contract: 'hermes.execution-history/v1'
+    profile: string
+    records: CronExecutionRecord[]
+  }
+}
+
+export async function getCronJobHistory(jobId: string, limit = 20, profile?: string): Promise<CronJobHistory> {
+  const suffix = profile ? `&profile=${encodeURIComponent(profile)}` : ''
+
+  const history = await hermesApi<CronJobHistory>({
     ...profileScoped(),
     ...connectionScoped(),
-    path: `/api/cron/jobs/${encodeURIComponent(jobId)}/runs?limit=${limit}`
+    path: `/api/cron/jobs/${encodeURIComponent(jobId)}/runs?limit=${limit}${suffix}`
   })
 
-  return runs ?? []
+  // Only a missing capability enables the conversation-only compatibility path.
+  // Network failures and malformed/new contracts must remain visible errors.
+  if (
+    history.execution_history !== undefined &&
+    (history.execution_history?.contract !== 'hermes.execution-history/v1' ||
+      !Array.isArray(history.execution_history.records))
+  ) {
+    throw new Error('Unsupported cron execution history')
+  }
+
+  return { ...history, runs: history.runs ?? [] }
+}
+
+// Compatibility for callers that explicitly request conversations.
+export async function getCronJobRuns(jobId: string, limit = 20): Promise<SessionInfo[]> {
+  return (await getCronJobHistory(jobId, limit)).runs
 }
 
 // The single source of truth for cron delivery targets (local + configured

@@ -883,6 +883,8 @@ export interface CronJob {
   name?: null | string
   next_run_at?: null | string
   no_agent?: boolean
+  /** Backend-owned profile; required to read the right history in an all-profile list. */
+  profile?: string
   prompt?: null | string
   provider?: null | string
   schedule?: CronJobSchedule

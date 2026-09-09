@@ -331,8 +331,19 @@ that its owner is gone. Unknown attempts are audit records and are never
 automatically rerun.
 
 Inspect recent attempts with `hermes cron runs [job-id] --limit 20` (alias:
-`history`). Terminal history is bounded; active attempts are never pruned. The
-ledger is included in quick backups.
+`history`). Terminal history has no implicit retention limit in this fork;
+active attempts are never pruned. The ledger is included in quick backups.
+
+Desktop's job detail and sidebar history use the same profile-scoped execution
+ledger, including script-only jobs that never create a conversation. The
+`/api/cron/jobs/{id}/runs` response adds `execution_history` with the existing
+`hermes.execution-history/v1` contract and records ordered by durable sequence.
+Each record keeps process status, the validated functional receipt, and message
+delivery separate. Opening a record inspects its result; only an actual
+conversation opens a chat. The existing `runs` array remains a separate list of
+conversations for older clients. An older backend without the new field is
+identified as conversation-only; an unavailable or invalid history is an error,
+not an empty successful run list. Read retries never trigger job execution.
 
 ### Repeated-failure review nudge
 

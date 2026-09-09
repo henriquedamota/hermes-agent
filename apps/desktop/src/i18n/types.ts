@@ -1844,6 +1844,12 @@ export interface Translations {
     emptyTitleSearch: string
     last: string
     next: string
+    historyUnavailable: string
+    historyRetry: string
+    historyLegacy: string
+    historyConversations: string
+    historyProcess: string
+    historyDelivery: string
     noRuns: string
     manage: string
     showRuns: string

@@ -1,5 +1,4 @@
 import { createCronTriggerController, type CronTriggerController } from '@hermes/shared'
-import { useStore } from '@nanostores/react'
 import { useEffect, useMemo, useRef, useState } from 'react'
 
 import { usePaneVisible } from '@/components/pane-shell/pane-visibility'
@@ -9,17 +8,16 @@ import { DisclosureCaret } from '@/components/ui/disclosure-caret'
 import { GlyphSpinner } from '@/components/ui/glyph-spinner'
 import { SidebarGroup, SidebarGroupContent } from '@/components/ui/sidebar'
 import { Tip } from '@/components/ui/tooltip'
-import { deleteCronJob, getCronJobRuns, pauseCronJob, resumeCronJob, type SessionInfo } from '@/hermes'
+import { deleteCronJob, pauseCronJob, resumeCronJob } from '@/hermes'
 import { useI18n } from '@/i18n'
-import { fmtDayTime, relativeTime } from '@/lib/time'
+import { relativeTime } from '@/lib/time'
 import { cn } from '@/lib/utils'
 import { confirm } from '@/store/confirm'
 import { updateCronJobs } from '@/store/cron'
-import { $changeEventsAvailable, $cronChangeTick } from '@/store/live-sync'
 import { notify, notifyError } from '@/store/notifications'
-import { $selectedStoredSessionId } from '@/store/session'
 import type { CronJob } from '@/types/hermes'
 
+import { CronRunHistory } from '../../cron/cron-run-history'
 import { jobState, jobTitle, STATE_DOT } from '../../cron/job-state'
 import { SidebarPanelLabel } from '../../shell/sidebar-label'
 
@@ -27,16 +25,6 @@ import { SidebarRowBody, SidebarRowLabel, SidebarRowLead, SidebarRowShell } from
 import { SidebarLoadMoreRow } from './load-more-row'
 
 const INACTIVE_STATES = new Set(['completed', 'disabled', 'error', 'paused'])
-
-// Recent runs shown in the inline quick-peek — enough to glance at history
-// without turning the sidebar into the full Cron page.
-const PEEK_RUN_LIMIT = 5
-
-// Runs are written by the background scheduler tick. cron.changed reloads the
-// open peek immediately on event-capable backends (poll drops to a backstop);
-// older backends keep the legacy cadence.
-const PEEK_POLL_INTERVAL_MS = 8000
-const PEEK_BACKSTOP_INTERVAL_MS = 60_000
 
 // Keep the section compact: show a few jobs up front, reveal more in larger
 // steps on demand (mirrors the messaging sections in the sidebar).
@@ -51,19 +39,6 @@ function nextRunMs(job: CronJob): null | number {
   const ms = Date.parse(job.next_run_at)
 
   return Number.isNaN(ms) ? null : ms
-}
-
-// Runs all belong to the same job, so the run name just repeats the job name —
-// the timestamp is what tells them apart. Compact (no year, no seconds) for the
-// narrow sidebar.
-function formatRunTime(seconds?: null | number): string {
-  if (!seconds) {
-    return '—'
-  }
-
-  const date = new Date(seconds * 1000)
-
-  return Number.isNaN(date.valueOf()) ? '—' : fmtDayTime.format(date)
 }
 
 interface SidebarCronJobsSectionProps {
@@ -377,90 +352,25 @@ function CronJobSidebarRow({
           </Tip>
         </SidebarRowShell>
       </ActionsContextMenu>
-      {expanded && <CronJobSidebarRuns jobId={job.id} onOpenRun={onOpenRun} />}
+      {expanded && <CronJobSidebarRuns job={job} onOpenRun={onOpenRun} />}
     </div>
   )
 }
 
-function CronJobSidebarRuns({ jobId, onOpenRun }: { jobId: string; onOpenRun: (sessionId: string) => void }) {
+function CronJobSidebarRuns({ job, onOpenRun }: { job: CronJob; onOpenRun: (sessionId: string) => void }) {
   const { t } = useI18n()
-  const c = t.cron
-  const selectedSessionId = useStore($selectedStoredSessionId)
-  const changeEventsAvailable = useStore($changeEventsAvailable)
-  const cronChangeTick = useStore($cronChangeTick)
-  const [runs, setRuns] = useState<null | SessionInfo[]>(null)
   const visible = usePaneVisible()
 
-  useEffect(() => {
-    let cancelled = false
-
-    const load = () =>
-      getCronJobRuns(jobId, PEEK_RUN_LIMIT)
-        .then(result => {
-          if (!cancelled) {
-            setRuns(result)
-          }
-        })
-        .catch(() => {
-          if (!cancelled) {
-            setRuns(prev => prev ?? [])
-          }
-        })
-
-    // Hidden pane: skip the peek entirely — no initial load, no interval.
-    // `visible` is in the dep array, so becoming visible re-runs this effect
-    // and starts the load + timer fresh (same shape as the section clock).
-    if (!visible) {
-      return () => {
-        cancelled = true
-      }
-    }
-
-    void load()
-
-    const intervalId = window.setInterval(
-      () => {
-        if (document.visibilityState === 'visible') {
-          void load()
-        }
-      },
-      changeEventsAvailable ? PEEK_BACKSTOP_INTERVAL_MS : PEEK_POLL_INTERVAL_MS
-    )
-
-    return () => {
-      cancelled = true
-      window.clearInterval(intervalId)
-    }
-    // cronChangeTick: a fired run reloads the peek immediately.
-  }, [changeEventsAvailable, cronChangeTick, jobId, visible])
-
   return (
-    <div className="mb-1 ml-[1.375rem] flex flex-col gap-px">
-      {runs === null ? (
-        <div className="flex items-center gap-1.5 py-1 pl-1 text-[0.6875rem] text-(--ui-text-tertiary)">
-          <GlyphSpinner ariaLabel={c.loading} className="text-[0.75rem]" />
-        </div>
-      ) : runs.length === 0 ? (
-        <div className="py-1 pl-1 text-[0.6875rem] text-(--ui-text-tertiary)">{c.noRuns}</div>
-      ) : (
-        <>
-          {runs.map(run => (
-            <button
-              className={cn(
-                'truncate rounded-md px-1.5 py-0.5 text-left text-[0.6875rem] tabular-nums focus-visible:bg-(--chrome-action-hover) focus-visible:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/40',
-                run.id === selectedSessionId
-                  ? 'bg-(--ui-row-active-background) text-foreground'
-                  : 'text-(--ui-text-secondary) hover:bg-(--chrome-action-hover) hover:text-foreground'
-              )}
-              key={run.id}
-              onClick={() => onOpenRun(run.id)}
-              type="button"
-            >
-              {formatRunTime(run.last_active || run.started_at)}
-            </button>
-          ))}
-        </>
-      )}
+    <div className="mb-1 ml-[1.375rem]">
+      <CronRunHistory
+        c={t.cron}
+        compact
+        jobId={job.id}
+        onOpenSession={onOpenRun}
+        profile={job.profile}
+        visible={visible}
+      />
     </div>
   )
 }
